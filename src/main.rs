@@ -2,13 +2,19 @@
 //!
 //! Stages (each timed to stderr in microseconds; stdout stays empty):
 //!   load     manifest, products, campaigns; mmap every CSV in parallel
-//!   links    parse links in parallel, union-find, name each person by the byte-wise smallest ID
+//!   links    parallel parse, hash-partitioned ID interning, union-find (root = byte-wise
+//!            smallest ID), per-partition lookup tables small enough to stay cache-resident
 //!   events   parallel chunked parse + per-copy validation, radix-scattered by hash(event_id)
-//!   clicks   parallel chunked parse + validation, resolved to person, scattered by hash(person)
-//!   dedup    per event_id partition: keep the smallest ingest_ts copy, emit survivors by person
+//!   clicks   parallel chunked parse + validation, scattered by hash(user_id)
+//!   dedup    per event_id partition: keep the smallest ingest_ts copy, scatter by hash(user_id)
+//!   resolve  per user_id partition: map each ID to its person via that partition's link table,
+//!            scatter events and clicks by hash(person)
 //!   persons  per person partition (largest first): sessionize, credit, assists, user_daily shard
 //!   campaign merge per-worker campaign/day counters, write campaign_daily
 //! then `_exit(0)`.
+//!
+//! IDs up to 15 bytes are stored inline in 16-byte `Key`s, so after parsing no stage touches
+//! the input files again; longer IDs keep a pointer into the mmap (exact general fallback).
 
 mod csvp;
 mod parquet;
@@ -23,7 +29,7 @@ use std::time::Instant;
 
 use parquet::{Column, Kind};
 use ts::DAY;
-use util::{hash, Bs, StrMap};
+use util::{hash, Bs, Key, KeyMap, StrMap};
 
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
@@ -36,51 +42,38 @@ fn part(h: u64) -> usize {
 
 // ------------------------------------------------------------------ records
 
-/// One parsed event copy (valid or not), scattered by hash(event_id) for dedup.
+/// One parsed event copy (valid or not), scattered by hash(event_id) for dedup. 64 bytes.
 #[derive(Clone, Copy)]
 struct Ev {
     idh: u64,
     ingest: i64,
     ts: i64,
-    idp: *const u8,
-    up: *const u8,
-    idn: u32,
-    un: u32,
+    id: Key,
+    user: Key,
     price: u32,
     cat: u16,
     kind: u8,
     valid: bool,
 }
-unsafe impl Send for Ev {}
-unsafe impl Sync for Ev {}
-impl Ev {
-    #[inline(always)]
-    fn id(&self) -> &'static [u8] {
-        Bs { p: self.idp, n: self.idn }.get()
-    }
-}
 
-/// A surviving event, keyed by person, scattered by hash(person name).
+/// A surviving event keyed by user ID (after dedup) or by person (after resolve). 40 bytes.
 #[derive(Clone, Copy)]
-struct PEv {
-    nh: u64,
+struct PE {
+    h: u64,
+    key: Key,
     ts: i64,
-    np: *const u8,
-    nn: u32,
     price: u32,
     cat: u16,
     kind: u8,
 }
-unsafe impl Send for PEv {}
-unsafe impl Sync for PEv {}
 
-/// A valid click, keyed by person, scattered by hash(person name).
+/// A valid click keyed by user ID (after parse) or by person (after resolve). 56 bytes.
 #[derive(Clone, Copy)]
-struct Cl {
-    nh: u64,
+struct PC {
+    h: u64,
+    key: Key,
     ts: i64,
-    name: Bs,
-    id: Bs,
+    id: Key,
     camp: u32,
 }
 
@@ -97,7 +90,7 @@ struct SE {
 #[derive(Clone, Copy)]
 struct SC {
     ts: i64,
-    id: Bs,
+    id: Key,
     camp: u32,
 }
 
@@ -119,18 +112,19 @@ struct Ctx {
     ndays: usize,
 }
 
-struct Links {
-    map: StrMap<u32>,
-    name: Vec<Bs>,
+/// Link lookup for the IDs whose hash falls in one partition.
+struct LinkPart {
+    map: KeyMap<u32>,
+    name: Vec<Key>,
     nh: Vec<u64>,
 }
 
-impl Links {
+impl LinkPart {
     #[inline(always)]
-    fn resolve(&self, u: Bs, uh: u64) -> (Bs, u64) {
-        match self.map.get(uh, u.get()) {
-            Some(i) => (self.name[i as usize], self.nh[i as usize]),
-            None => (u, uh),
+    fn resolve(&self, h: u64, k: Key) -> (u64, Key) {
+        match self.map.get(h, &k) {
+            Some(i) => (self.nh[i as usize], self.name[i as usize]),
+            None => (h, k),
         }
     }
 }
@@ -143,6 +137,18 @@ fn run_par<R: Send>(nt: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
         let hs: Vec<_> = (0..nt).map(|t| s.spawn(move || f(t))).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
+}
+
+/// Raw pointer for disjoint parallel writes.
+#[derive(Clone, Copy)]
+struct SyncPtr<T>(*mut T);
+unsafe impl<T> Send for SyncPtr<T> {}
+unsafe impl<T> Sync for SyncPtr<T> {}
+impl<T> SyncPtr<T> {
+    #[inline(always)]
+    fn at(self, i: usize) -> *mut T {
+        unsafe { self.0.add(i) }
+    }
 }
 
 fn leak_read(path: &Path) -> &'static [u8] {
@@ -217,9 +223,17 @@ fn make_chunks(files: &[&'static [u8]], target: usize) -> Vec<&'static [u8]> {
             s = e;
         }
     }
-    // Largest first for balance.
     out.sort_by_key(|c| std::cmp::Reverse(c.len()));
     out
+}
+
+/// Estimated row count of a set of files, from the line density of a sample of the largest.
+fn est_rows(files: &[&'static [u8]]) -> usize {
+    let total: usize = files.iter().map(|f| f.len()).sum();
+    let Some(big) = files.iter().max_by_key(|f| f.len()) else { return 0 };
+    let sample = &big[..big.len().min(1 << 20)];
+    let lines = memchr::memchr_iter(b'\n', sample).count().max(1);
+    total / (sample.len() / lines).max(1) + files.len()
 }
 
 fn json_str(s: &str, key: &str) -> Option<String> {
@@ -243,8 +257,183 @@ fn transpose<T>(per_thread: Vec<Vec<Vec<T>>>) -> Vec<Mutex<Vec<Vec<T>>>> {
     out.into_iter().map(Mutex::new).collect()
 }
 
-fn new_bufs<T>() -> Vec<Vec<T>> {
-    (0..PB).map(|_| Vec::new()).collect()
+/// PB scatter buffers, each pre-sized for `rows` spread over `nt` threads (with slack).
+/// Large reservations are mmapped lazily by glibc, so unused capacity costs no RSS.
+fn new_bufs<T>(rows: usize, nt: usize) -> Vec<Vec<T>> {
+    let cap = rows / (nt * PB) * 5 / 4 + 64;
+    (0..PB).map(|_| Vec::with_capacity(cap)).collect()
+}
+
+// ------------------------------------------------------------------ links
+
+fn build_links(files: &[&'static [u8]], target: usize, nt: usize) -> Vec<LinkPart> {
+    // A: parse; scatter each ID occurrence by hash partition.
+    #[derive(Clone, Copy)]
+    struct Occ {
+        h: u64,
+        key: Key,
+        pair: u32, // thread-local pair index
+        side: u32,
+    }
+    let chunks = make_chunks(files, target);
+    let rows = est_rows(files);
+    let next = AtomicUsize::new(0);
+    let per_thread: Vec<(Vec<Vec<Occ>>, u32)> = run_par(nt, |_| {
+        let mut bufs: Vec<Vec<Occ>> = new_bufs(rows * 2, nt);
+        let mut npairs = 0u32;
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= chunks.len() {
+                break;
+            }
+            csvp::for_lines(chunks[i], |line| {
+                let mut f = [Bs::EMPTY; 2];
+                if csvp::split(line, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
+                    for side in 0..2 {
+                        let h = hash(f[side].get());
+                        bufs[part(h)].push(Occ { h, key: Key::from_bs(f[side]), pair: npairs, side: side as u32 });
+                    }
+                    npairs += 1;
+                }
+            });
+        }
+        (bufs, npairs)
+    });
+    let mut pair_base = Vec::with_capacity(nt);
+    let mut npairs = 0usize;
+    let mut occ_parts: Vec<Vec<Vec<Occ>>> = (0..PB).map(|_| Vec::new()).collect();
+    for (t, (bufs, n)) in per_thread.into_iter().enumerate() {
+        pair_base.push(npairs);
+        npairs += n as usize;
+        for (p, v) in bufs.into_iter().enumerate() {
+            occ_parts[p].push(v);
+            debug_assert_eq!(occ_parts[p].len(), t + 1);
+        }
+    }
+    let empty = || (0..PB).map(|_| LinkPart { map: KeyMap::with_capacity(0), name: Vec::new(), nh: Vec::new() }).collect();
+    if npairs == 0 {
+        return empty();
+    }
+
+    // B: per partition, intern distinct IDs (local index per occurrence).
+    let next = AtomicUsize::new(0);
+    let interned: Vec<Mutex<Option<(KeyMap<u32>, Vec<Key>, Vec<u32>)>>> = (0..PB).map(|_| Mutex::new(None)).collect();
+    run_par(nt, |_| loop {
+        let p = next.fetch_add(1, Relaxed);
+        if p >= PB {
+            break;
+        }
+        let n: usize = occ_parts[p].iter().map(|v| v.len()).sum();
+        let mut map: KeyMap<u32> = KeyMap::with_capacity(n / 2 + 8);
+        let mut keys = Vec::new();
+        let mut locals = Vec::with_capacity(n);
+        for v in &occ_parts[p] {
+            for o in v {
+                let (l, ins) = map.get_or_insert(o.h, o.key, keys.len() as u32);
+                if ins {
+                    keys.push(o.key);
+                }
+                locals.push(l);
+            }
+        }
+        *interned[p].lock().unwrap() = Some((map, keys, locals));
+    });
+    let interned: Vec<(KeyMap<u32>, Vec<Key>, Vec<u32>)> =
+        interned.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
+    let mut base = Vec::with_capacity(PB + 1);
+    let mut nids = 0usize;
+    for (_, keys, _) in &interned {
+        base.push(nids);
+        nids += keys.len();
+    }
+
+    // C: global ID per pair side, global key array.
+    let mut pair_gid = vec![0u32; npairs * 2];
+    let mut gkeys = vec![Key::EMPTY; nids];
+    {
+        let pg = SyncPtr(pair_gid.as_mut_ptr());
+        let gk = SyncPtr(gkeys.as_mut_ptr());
+        let next = AtomicUsize::new(0);
+        let (occ_parts, interned, base, pair_base) = (&occ_parts, &interned, &base, &pair_base);
+        run_par(nt, move |_| loop {
+            let p = next.fetch_add(1, Relaxed);
+            if p >= PB {
+                break;
+            }
+            let (_, keys, locals) = &interned[p];
+            for (l, k) in keys.iter().enumerate() {
+                unsafe { *gk.at(base[p] + l) = *k };
+            }
+            let mut i = 0;
+            for (t, v) in occ_parts[p].iter().enumerate() {
+                for o in v {
+                    let gid = (base[p] + locals[i] as usize) as u32;
+                    i += 1;
+                    let slot = (pair_base[t] + o.pair as usize) * 2 + o.side as usize;
+                    unsafe { *pg.at(slot) = gid };
+                }
+            }
+        });
+    }
+    drop(occ_parts);
+
+    // D: union-find; the root of each set is always its byte-wise smallest ID.
+    let mut parent: Vec<u32> = (0..nids as u32).collect();
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            let gp = parent[parent[x as usize] as usize];
+            parent[x as usize] = gp;
+            x = gp;
+        }
+        x
+    }
+    for pr in pair_gid.chunks_exact(2) {
+        let ra = find(&mut parent, pr[0]);
+        let rb = find(&mut parent, pr[1]);
+        if ra != rb {
+            if gkeys[ra as usize].get() < gkeys[rb as usize].get() {
+                parent[rb as usize] = ra;
+            } else {
+                parent[ra as usize] = rb;
+            }
+        }
+    }
+    for i in 0..nids as u32 {
+        let r = find(&mut parent, i);
+        parent[i as usize] = r;
+    }
+    drop(pair_gid);
+
+    // E: per partition, each ID's person name and its hash.
+    let root_hash: Vec<u64> = {
+        // Hash only roots (in parallel, by index range).
+        let mut rh = vec![0u64; nids];
+        let ptr = SyncPtr(rh.as_mut_ptr());
+        let per = nids.div_ceil(nt);
+        let (parent, gkeys) = (&parent, &gkeys);
+        run_par(nt, move |t| {
+            for i in t * per..((t + 1) * per).min(nids) {
+                if parent[i] as usize == i {
+                    unsafe { *ptr.at(i) = hash(gkeys[i].get()) };
+                }
+            }
+        });
+        rh
+    };
+    interned
+        .into_iter()
+        .enumerate()
+        .map(|(p, (map, keys, _))| {
+            let mut name = Vec::with_capacity(keys.len());
+            let mut nh = Vec::with_capacity(keys.len());
+            for l in 0..keys.len() {
+                let r = parent[base[p] + l] as usize;
+                name.push(gkeys[r]);
+                nh.push(root_hash[r]);
+            }
+            LinkPart { map, name, nh }
+        })
+        .collect()
 }
 
 // ------------------------------------------------------------------ campaign accumulator
@@ -328,7 +517,7 @@ struct Worker<'a> {
     ctx: &'a Ctx,
     acc: Acc,
     // user_daily rows
-    u_name: Vec<Bs>,
+    u_name: Vec<Key>,
     u_day: Vec<i32>,
     u_sess: Vec<i64>,
     u_ev: Vec<i64>,
@@ -336,7 +525,7 @@ struct Worker<'a> {
     u_top: Vec<i32>,
     // scratch
     pid: Vec<u32>,
-    names: Vec<Bs>,
+    names: Vec<Key>,
     off: Vec<u32>,
     cur: Vec<u32>,
     se: Vec<SE>,
@@ -383,21 +572,20 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn partition(&mut self, evs: Vec<Vec<PEv>>, cls: Vec<Vec<Cl>>) {
+    fn partition(&mut self, evs: Vec<Vec<PE>>, cls: Vec<Vec<PC>>) {
         let n: usize = evs.iter().map(|v| v.len()).sum();
         if n == 0 {
             return;
         }
         // Group events by person (exact name bytes).
-        let mut pmap: StrMap<u32> = StrMap::with_capacity(n / 4 + 16);
+        let mut pmap: KeyMap<u32> = KeyMap::with_capacity(n / 4 + 16);
         self.pid.clear();
         self.names.clear();
         for piece in &evs {
             for e in piece {
-                let name = Bs { p: e.np, n: e.nn };
-                let (id, ins) = pmap.get_or_insert(e.nh, name, self.names.len() as u32);
+                let (id, ins) = pmap.get_or_insert(e.h, e.key, self.names.len() as u32);
                 if ins {
-                    self.names.push(name);
+                    self.names.push(e.key);
                 }
                 self.pid.push(id);
             }
@@ -432,7 +620,7 @@ impl<'a> Worker<'a> {
         let mut ccount = vec![0u32; np + 1];
         for piece in &cls {
             for c in piece {
-                let p = pmap.get(c.nh, c.name.get()).map_or(u32::MAX, |p| p);
+                let p = pmap.get(c.h, &c.key).unwrap_or(u32::MAX);
                 if p != u32::MAX {
                     ccount[p as usize + 1] += 1;
                 }
@@ -446,7 +634,7 @@ impl<'a> Worker<'a> {
         self.coff.extend_from_slice(&ccount);
         let ctotal = ccount[np] as usize;
         self.sc.clear();
-        self.sc.resize(ctotal, SC { ts: 0, id: Bs::EMPTY, camp: 0 });
+        self.sc.resize(ctotal, SC { ts: 0, id: Key::EMPTY, camp: 0 });
         let mut k = 0;
         for piece in &cls {
             for c in piece {
@@ -477,7 +665,7 @@ impl<'a> Worker<'a> {
         self.sc = sc;
     }
 
-    fn person(&mut self, name: Bs, evs: &[SE], cls: &[SC]) {
+    fn person(&mut self, name: Key, evs: &[SE], cls: &[SC]) {
         let ctx = self.ctx;
         // Sessionize.
         self.sess.clear();
@@ -644,8 +832,9 @@ fn main() {
     };
 
     unsafe {
-        // Keep big freed buffers returning to the OS (glibc otherwise raises the threshold).
-        libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+        // Fixed mmap threshold: big buffers are mmapped (lazily faulted, freed to the OS, grown
+        // with mremap instead of memcpy); glibc would otherwise keep raising the threshold.
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 128 << 10);
     }
 
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
@@ -763,85 +952,19 @@ fn main() {
     }
     let total_bytes: usize = files.iter().flatten().map(|f| f.len()).sum();
     let target = (total_bytes / (nt * 16)).clamp(1 << 16, 8 << 20);
+    let ev_rows = est_rows(&files[0]);
+    let cl_rows = est_rows(&files[1]);
     stage("load");
 
     // ---- links
-    let links = {
-        let chunks = make_chunks(&files[2], target);
-        let next = AtomicUsize::new(0);
-        let pairs: Vec<Vec<(Bs, u64, Bs, u64)>> = run_par(nt, |_| {
-            let mut v = Vec::new();
-            loop {
-                let i = next.fetch_add(1, Relaxed);
-                if i >= chunks.len() {
-                    break;
-                }
-                csvp::for_lines(chunks[i], |line| {
-                    let mut f = [Bs::EMPTY; 2];
-                    if csvp::split(line, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
-                        v.push((f[0], hash(f[0].get()), f[1], hash(f[1].get())));
-                    }
-                });
-            }
-            v
-        });
-        let total: usize = pairs.iter().map(|v| v.len()).sum();
-        let mut map: StrMap<u32> = StrMap::with_capacity(total * 2);
-        let mut ids: Vec<Bs> = Vec::with_capacity(total * 2);
-        let mut parent: Vec<u32> = Vec::with_capacity(total * 2);
-        fn find(parent: &mut [u32], mut x: u32) -> u32 {
-            while parent[x as usize] != x {
-                let gp = parent[parent[x as usize] as usize];
-                parent[x as usize] = gp;
-                x = gp;
-            }
-            x
-        }
-        for v in &pairs {
-            for &(a, ha, b, hb) in v {
-                let (ia, ins) = map.get_or_insert(ha, a, ids.len() as u32);
-                if ins {
-                    ids.push(a);
-                    parent.push(ia);
-                }
-                let (ib, ins) = map.get_or_insert(hb, b, ids.len() as u32);
-                if ins {
-                    ids.push(b);
-                    parent.push(ib);
-                }
-                let ra = find(&mut parent, ia);
-                let rb = find(&mut parent, ib);
-                if ra != rb {
-                    // Keep the root whose ID is smaller, so the root's ID is the name.
-                    if ids[ra as usize].get() < ids[rb as usize].get() {
-                        parent[rb as usize] = ra;
-                    } else {
-                        parent[ra as usize] = rb;
-                    }
-                }
-            }
-        }
-        let n = ids.len();
-        let mut name = Vec::with_capacity(n);
-        let mut nh = Vec::with_capacity(n);
-        for i in 0..n {
-            let r = find(&mut parent, i as u32);
-            name.push(ids[r as usize]);
-        }
-        let mut hcache: HashMap<usize, u64> = HashMap::new();
-        for nm in &name {
-            let h = *hcache.entry(nm.p as usize).or_insert_with(|| hash(nm.get()));
-            nh.push(h);
-        }
-        Links { map, name, nh }
-    };
+    let links = build_links(&files[2], target, nt);
     stage("links");
 
     // ---- events: parse + validate each copy, scatter by hash(event_id)
     let ev_chunks = make_chunks(&files[0], target);
     let next = AtomicUsize::new(0);
     let ev_bufs: Vec<Vec<Vec<Ev>>> = run_par(nt, |_| {
-        let mut bufs: Vec<Vec<Ev>> = new_bufs();
+        let mut bufs: Vec<Vec<Ev>> = new_bufs(ev_rows, nt);
         let ctx = &ctx;
         loop {
             let i = next.fetch_add(1, Relaxed);
@@ -893,10 +1016,8 @@ fn main() {
                     idh,
                     ingest,
                     ts: t,
-                    idp: f[0].p,
-                    up: f[1].p,
-                    idn: f[0].n,
-                    un: f[1].n,
+                    id: Key::from_bs(f[0]),
+                    user: if valid { Key::from_bs(f[1]) } else { Key::EMPTY },
                     price,
                     cat,
                     kind,
@@ -908,13 +1029,12 @@ fn main() {
     });
     stage("events");
 
-    // ---- clicks: parse + validate, resolve person, scatter by hash(person)
+    // ---- clicks: parse + validate, scatter by hash(user_id)
     let cl_chunks = make_chunks(&files[1], target);
     let next = AtomicUsize::new(0);
-    let cl_bufs: Vec<Vec<Vec<Cl>>> = run_par(nt, |_| {
-        let mut bufs: Vec<Vec<Cl>> = new_bufs();
+    let cl_bufs: Vec<Vec<Vec<PC>>> = run_par(nt, |_| {
+        let mut bufs: Vec<Vec<PC>> = new_bufs(cl_rows, nt);
         let ctx = &ctx;
-        let links = &links;
         loop {
             let i = next.fetch_add(1, Relaxed);
             if i >= cl_chunks.len() {
@@ -933,21 +1053,21 @@ fn main() {
                     Some(c) => c,
                     None => return,
                 };
-                let (name, nh) = links.resolve(f[1], hash(f[1].get()));
-                bufs[part(nh)].push(Cl { nh, ts: t, name, id: f[0], camp });
+                let uh = hash(f[1].get());
+                bufs[part(uh)].push(PC { h: uh, key: Key::from_bs(f[1]), ts: t, id: Key::from_bs(f[0]), camp });
             });
         }
         bufs
     });
     stage("clicks");
 
-    // ---- dedup per event_id partition, emit survivors by person
+    // ---- dedup per event_id partition, scatter survivors by hash(user_id)
     let ev_parts = transpose(ev_bufs);
     let next = AtomicUsize::new(0);
-    let pev_bufs: Vec<Vec<Vec<PEv>>> = run_par(nt, |_| {
-        let mut out: Vec<Vec<PEv>> = new_bufs();
-        let mut table: Vec<u64> = Vec::new();
-        let links = &links;
+    let ue_bufs: Vec<Vec<Vec<PE>>> = run_par(nt, |_| {
+        let mut out: Vec<Vec<PE>> = new_bufs(ev_rows, nt);
+        // (event_id hash, code = piece << 32 | index, +1; 0 = empty)
+        let mut table: Vec<(u64, u64)> = Vec::new();
         loop {
             let b = next.fetch_add(1, Relaxed);
             if b >= PB {
@@ -958,50 +1078,57 @@ fn main() {
             if n == 0 {
                 continue;
             }
+            let at = |c: u64| &pieces[((c - 1) >> 32) as usize][((c - 1) & 0xffff_ffff) as usize];
             let cap = (n * 2).next_power_of_two();
             let mask = cap - 1;
             table.clear();
-            table.resize(cap, 0);
+            table.resize(cap, (0, 0));
             for (pi, piece) in pieces.iter().enumerate() {
                 for (i, e) in piece.iter().enumerate() {
                     let code = (((pi as u64) << 32) | i as u64) + 1;
                     let mut s = (e.idh as usize) & mask;
                     loop {
-                        let c = table[s];
+                        let (h, c) = table[s];
                         if c == 0 {
-                            table[s] = code;
+                            table[s] = (e.idh, code);
                             break;
                         }
-                        let o = &pieces[((c - 1) >> 32) as usize][((c - 1) & 0xffff_ffff) as usize];
-                        if o.idh == e.idh && o.id() == e.id() {
-                            if e.ingest < o.ingest {
-                                table[s] = code;
+                        if h == e.idh {
+                            let o = at(c);
+                            if o.id.same(&e.id) {
+                                if e.ingest < o.ingest {
+                                    table[s].1 = code;
+                                }
+                                break;
                             }
-                            break;
                         }
                         s = (s + 1) & mask;
                     }
                 }
             }
-            for &c in &table {
-                if c == 0 {
-                    continue;
+            // Emit in input order: a valid copy survives iff it is its event_id's kept copy.
+            for (pi, piece) in pieces.iter().enumerate() {
+                for (i, e) in piece.iter().enumerate() {
+                    if !e.valid {
+                        continue;
+                    }
+                    let code = (((pi as u64) << 32) | i as u64) + 1;
+                    let mut s = (e.idh as usize) & mask;
+                    let winner = loop {
+                        let (h, c) = table[s];
+                        if c == code {
+                            break true;
+                        }
+                        if c != 0 && h == e.idh && at(c).id.same(&e.id) {
+                            break false;
+                        }
+                        s = (s + 1) & mask;
+                    };
+                    if winner {
+                        let uh = hash(e.user.get());
+                        out[part(uh)].push(PE { h: uh, key: e.user, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
+                    }
                 }
-                let e = &pieces[((c - 1) >> 32) as usize][((c - 1) & 0xffff_ffff) as usize];
-                if !e.valid {
-                    continue;
-                }
-                let u = Bs { p: e.up, n: e.un };
-                let (name, nh) = links.resolve(u, hash(u.get()));
-                out[part(nh)].push(PEv {
-                    nh,
-                    ts: e.ts,
-                    np: name.p,
-                    nn: name.n,
-                    price: e.price,
-                    cat: e.cat,
-                    kind: e.kind,
-                });
             }
         }
         out
@@ -1009,9 +1136,42 @@ fn main() {
     drop(ev_parts);
     stage("dedup");
 
+    // ---- resolve: user ID -> person, scatter by hash(person)
+    let ue_parts = transpose(ue_bufs);
+    let uc_parts = transpose(cl_bufs);
+    let next = AtomicUsize::new(0);
+    let resolved: Vec<(Vec<Vec<PE>>, Vec<Vec<PC>>)> = run_par(nt, |_| {
+        let mut oe: Vec<Vec<PE>> = new_bufs(ev_rows, nt);
+        let mut oc: Vec<Vec<PC>> = new_bufs(cl_rows, nt);
+        loop {
+            let u = next.fetch_add(1, Relaxed);
+            if u >= PB {
+                break;
+            }
+            let lp = &links[u];
+            for piece in std::mem::take(&mut *ue_parts[u].lock().unwrap()) {
+                for e in piece {
+                    let (nh, name) = lp.resolve(e.h, e.key);
+                    oe[part(nh)].push(PE { h: nh, key: name, ..e });
+                }
+            }
+            for piece in std::mem::take(&mut *uc_parts[u].lock().unwrap()) {
+                for c in piece {
+                    let (nh, name) = lp.resolve(c.h, c.key);
+                    oc[part(nh)].push(PC { h: nh, key: name, ..c });
+                }
+            }
+        }
+        (oe, oc)
+    });
+    drop(ue_parts);
+    drop(uc_parts);
+    let (pe_bufs, pc_bufs): (Vec<_>, Vec<_>) = resolved.into_iter().unzip();
+    stage("resolve");
+
     // ---- persons
-    let pev_parts = transpose(pev_bufs);
-    let cl_parts = transpose(cl_bufs);
+    let pev_parts = transpose(pe_bufs);
+    let cl_parts = transpose(pc_bufs);
     let mut order: Vec<(usize, usize)> = pev_parts
         .iter()
         .enumerate()
