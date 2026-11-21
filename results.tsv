@@ -1,0 +1,2 @@
+commit	status	bench20_ms	stress60_rss_mb	bottleneck_stage	change
+99b2b76	KEEP	2647	10886	dedup	v1 baseline: all 4 verify modes pass (36/36 fixtures, dev_1m MATCH, stress60 12.4s)
