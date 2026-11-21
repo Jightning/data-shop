@@ -1,38 +1,27 @@
-# Shopping Sessions Speed Pipeline
+# AGENTS.md — Shopping Sessions (< 0.25s Target)
 
-## Objective
-Minimize end-to-end container wall time (target: < 0.3s on 20M events) while maintaining 100% exact compliance with `rules.md` and staying safely under 18 GB peak RAM and < 120s on 60M events.
+## Target
+Beat **0.25s** end-to-end wall time on 20M events (container start to exit, 8 pinned vCPUs) while keeping **100% exact compliance** with `rules.md` and staying **< 18 GB peak RSS** and **< 60s** on 60M events (hard container limit: 24 GB, no swap, 180s final cap).
 
-## Editable Scope
-- `src/`, `Cargo.toml`, `Dockerfile`
-- `results.tsv` (append-only experiment log)
+## Boundaries
+- **Read-only (never edit):** `rules.md`, `fixtures/`, `Makefile`, `scripts/verify.sh`, `./local/`
+- **Editable:** `src/`, `Cargo.toml`, `Dockerfile`, `results.tsv`
 
-## Invariants
-1. **Zero stdout:** Print NOTHING to `stdout`. All timings/logs go strictly to `stderr`.
-2. **Container safety:** Respect `DATA_DIR`, `OUTPUT_DIR`, `SCRATCH_DIR`, `NCPU`, `MEM_GB`. Never write to `/` or `/tmp` (64 MB cap). Never use `-C target-cpu=native` (use runtime CPU detection for AVX2/SIMD so `linux/amd64` never crashes with `SIGILL`).
-3. **No dataset hardcoding:** Never hardcode window dates, counts of files/products/campaigns, or seed assumptions. Every optimization must preserve every edge case in `rules.md` (literal `\r`, strict quotes, untrimmed case-sensitive IDs, ASCII digits only, F1/F2/F3 timestamps including leap day 2028, dedup-before-validation, 400-hop DSU naming, exact boundary inequalities, header-only CSVs).
-4. **60M survival:** Peak RSS must stay < 18 GB on 60M events (container hard cap is 24 GB, no swap).
+## Constraints
+1. **Zero stdout:** `stdout` must be 0 bytes. Emit microsecond stage timings to `stderr`.
+2. **Container & ISA safety:** Respect `DATA_DIR`, `OUTPUT_DIR`, `SCRATCH_DIR`, `NCPU`, `MEM_GB`. Root FS is read-only; `/tmp` is 64 MB RAM; runs as uid 1000 with no network. Never compile with `-C target-cpu=native`—use runtime dispatch (`is_x86_feature_detected!`) for AVX2/AVX-512 so `linux/amd64` never triggers `SIGILL`.
+3. **Zero dataset hardcoding:** Inspect `../local-data/generator/` to optimize fast paths for realistic shapes, but every fast path must have an exact general fallback covering all `rules.md` edge cases (literal `\r`, strict quoting, untrimmed case-sensitive byte-wise IDs, ASCII-only digits, F1/F2/F3 including Feb 29 2028, dedup-before-validation even when later copies change `user_id`, 400-hop DSU naming, exact boundary inequalities, header-only CSVs, arbitrary window lengths).
 
-## Verification Commands
-Run these verbatim; never claim success without fresh command output:
-- Correctness gate (fast): `bash scripts/verify.sh correct` (36 fixtures + 1M dev check + self-checks + stdout == 0 bytes)
-- Speed benchmark (20M): `bash scripts/verify.sh bench20` (median of 3 runs + stderr stage timings)
-- Memory gate (60M): `bash scripts/verify.sh stress60` (wall time + peak RSS)
-- Container gate: `bash scripts/verify.sh docker` (read-only root, 64 MB `/tmp`, no network, uid 1000, 8 vCPUs, 24 GB RAM)
+## Commands
+- `bash scripts/verify.sh correct` — 36 fixtures + 1M dev diff + `rules.md` invariants + 0-byte stdout
+- `bash scripts/verify.sh bench20` — 3 runs on 20M (median ms, per-stage `stderr` breakdown, `perf stat` IPC/cache-misses/page-faults if available)
+- `bash scripts/verify.sh stress60` — 60M wall time + peak RSS (must stay < 18 GB)
+- `bash scripts/verify.sh docker` — exact `linux/amd64` container mirror + container startup overhead check
 
-## Required Workflow (Follow Every Turn)
-
-1. **Inspect:** Read `results.tsv` and the latest per-stage `stderr` timings. Pick the single slowest stage (Amdahl's law).
-2. **Hypothesize:** State ONE concrete change, the stage it targets, and why it preserves `rules.md` and < 18 GB RAM at 60M.
-3. **Edit:** Make the minimal focused change.
-4. **Verify Correctness FIRST:** Run `bash scripts/verify.sh correct`. If ANY check fails, fix root cause or revert immediately—never benchmark broken code.
-5. **Benchmark:** Run `bash scripts/verify.sh bench20`.
-6. **Promote or Revert:**
-   - **KEEP** if 20M median improves by >= 3% (or simplifies code at equal speed) AND `stress60` stays < 18 GB RAM (run `stress60` whenever memory layout or data structures change). Run `git commit` with the measured delta.
-   - **REVERT** otherwise: run `git checkout -- src/ Cargo.toml Dockerfile` to restore the last clean commit.
-7. **Log:** Append one tab-separated row to `results.tsv`:
-   `commit | status(KEEP/REVERT/FAIL) | bench20_ms | stress60_rss_mb | slowest_stage | hypothesis`
-8. **Fail fast:** If the same failure repeats twice, stop and diagnose the root cause instead of blindly retrying.
-
-## Output Format
-Be terse. Report: (1) hypothesis, (2) files changed, (3) exact command results (`correct`, `bench20`, stage timings), and (4) `KEEP` or `REVERT`.
+## Engineering Loop
+- Drive every optimization from real measurements (`bench20` stage breakdown + hardware counters), never guesswork.
+- Always run `verify.sh correct` after any code change before benchmarking.
+- Keep and commit changes that achieve a genuine speedup or clean architectural win while preserving correctness and 60M RAM headroom; revert regressions (`git checkout -- src/ Cargo.toml Dockerfile`).
+- Append one line per experiment to `results.tsv`:
+  `commit | status(KEEP/REVERT/FAIL) | bench20_ms | stress60_rss_mb | bottleneck_stage | change`
+- Never run `git push`.
