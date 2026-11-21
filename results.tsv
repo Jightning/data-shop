@@ -1,2 +1,3 @@
 commit	status	bench20_ms	stress60_rss_mb	bottleneck_stage	change
 99b2b76	KEEP	2647	10886	dedup	v1 baseline: all 4 verify modes pass (36/36 fixtures, dev_1m MATCH, stress60 12.4s)
+b240c0c	KEEP	1690	10747	events	E1 inline 16B keys + hash-partitioned link tables + resolve stage (dedup 1244->312ms, links 477->155ms); page faults 0.63M->1.2M
