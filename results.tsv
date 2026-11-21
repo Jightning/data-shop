@@ -1,3 +1,5 @@
 commit	status	bench20_ms	stress60_rss_mb	bottleneck_stage	change
 99b2b76	KEEP	2647	10886	dedup	v1 baseline: all 4 verify modes pass (36/36 fixtures, dev_1m MATCH, stress60 12.4s)
 b240c0c	KEEP	1690	10747	events	E1 inline 16B keys + hash-partitioned link tables + resolve stage (dedup 1244->312ms, links 477->155ms); page faults 0.63M->1.2M
+68ea010	REVERT	1949	-	events	E2 THP-advised per-thread scatter arenas: faults 1.2M->0.5M but one THP run stalled 935 s (sync compaction, defrag=madvise); no-THP arena 1797 ms = no gain
+a14b08d	KEEP	1774	10738	events	E3 dedup buckets split 16 ways (L2-resident u32 tables); alternating A/B x7: dedup 307->256ms, wall 1725->1641ms (bench20 3-run median noisy: 1774)
