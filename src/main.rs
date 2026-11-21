@@ -1066,8 +1066,11 @@ fn main() {
     let next = AtomicUsize::new(0);
     let ue_bufs: Vec<Vec<Vec<PE>>> = run_par(nt, |_| {
         let mut out: Vec<Vec<PE>> = new_bufs(ev_rows, nt);
-        // (event_id hash, code = piece << 32 | index, +1; 0 = empty)
-        let mut table: Vec<(u64, u64)> = Vec::new();
+        // Each bucket is split 16 ways by more hash bits into `scratch` so that every
+        // sub-bucket's records and its u32 index table stay L2-resident.
+        const SB: usize = 16;
+        let mut scratch: Vec<Ev> = Vec::new();
+        let mut table: Vec<u32> = Vec::new();
         loop {
             let b = next.fetch_add(1, Relaxed);
             if b >= PB {
@@ -1078,48 +1081,69 @@ fn main() {
             if n == 0 {
                 continue;
             }
-            let at = |c: u64| &pieces[((c - 1) >> 32) as usize][((c - 1) & 0xffff_ffff) as usize];
-            let cap = (n * 2).next_power_of_two();
-            let mask = cap - 1;
-            table.clear();
-            table.resize(cap, (0, 0));
-            for (pi, piece) in pieces.iter().enumerate() {
-                for (i, e) in piece.iter().enumerate() {
-                    let code = (((pi as u64) << 32) | i as u64) + 1;
+            let sub = |e: &Ev| ((e.idh >> 52) & (SB as u64 - 1)) as usize;
+            let mut start = [0usize; SB + 1];
+            for piece in &pieces {
+                for e in piece.iter() {
+                    start[sub(e) + 1] += 1;
+                }
+            }
+            for i in 0..SB {
+                start[i + 1] += start[i];
+            }
+            let mut pos = start;
+            scratch.clear();
+            scratch.reserve(n);
+            let dst = scratch.as_mut_ptr();
+            for piece in &pieces {
+                for e in piece.iter() {
+                    let k = sub(e);
+                    unsafe { dst.add(pos[k]).write(*e) };
+                    pos[k] += 1;
+                }
+            }
+            unsafe { scratch.set_len(n) };
+            drop(pieces);
+            for k in 0..SB {
+                let sl = &scratch[start[k]..start[k + 1]];
+                if sl.is_empty() {
+                    continue;
+                }
+                let cap = (sl.len() * 2).next_power_of_two();
+                let mask = cap - 1;
+                table.clear();
+                table.resize(cap, u32::MAX);
+                for (i, e) in sl.iter().enumerate() {
                     let mut s = (e.idh as usize) & mask;
                     loop {
-                        let (h, c) = table[s];
-                        if c == 0 {
-                            table[s] = (e.idh, code);
+                        let c = table[s];
+                        if c == u32::MAX {
+                            table[s] = i as u32;
                             break;
                         }
-                        if h == e.idh {
-                            let o = at(c);
-                            if o.id.same(&e.id) {
-                                if e.ingest < o.ingest {
-                                    table[s].1 = code;
-                                }
-                                break;
+                        let o = &sl[c as usize];
+                        if o.idh == e.idh && o.id.same(&e.id) {
+                            if e.ingest < o.ingest {
+                                table[s] = i as u32;
                             }
+                            break;
                         }
                         s = (s + 1) & mask;
                     }
                 }
-            }
-            // Emit in input order: a valid copy survives iff it is its event_id's kept copy.
-            for (pi, piece) in pieces.iter().enumerate() {
-                for (i, e) in piece.iter().enumerate() {
+                // Emit in order: a valid copy survives iff it is its event_id's kept copy.
+                for (i, e) in sl.iter().enumerate() {
                     if !e.valid {
                         continue;
                     }
-                    let code = (((pi as u64) << 32) | i as u64) + 1;
                     let mut s = (e.idh as usize) & mask;
                     let winner = loop {
-                        let (h, c) = table[s];
-                        if c == code {
+                        let c = table[s];
+                        if c == i as u32 {
                             break true;
                         }
-                        if c != 0 && h == e.idh && at(c).id.same(&e.id) {
+                        let o = &sl[c as usize];
+                        if o.idh == e.idh && o.id.same(&e.id) {
                             break false;
                         }
                         s = (s + 1) & mask;
