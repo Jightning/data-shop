@@ -831,12 +831,6 @@ fn main() {
         t_last = now;
     };
 
-    unsafe {
-        // Fixed mmap threshold: big buffers are mmapped (lazily faulted, freed to the OS, grown
-        // with mremap instead of memcpy); glibc would otherwise keep raising the threshold.
-        libc::mallopt(libc::M_MMAP_THRESHOLD, 128 << 10);
-    }
-
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let data = PathBuf::from(env("DATA_DIR", "/data"));
     let output = PathBuf::from(env("OUTPUT_DIR", "/output"));
@@ -934,6 +928,26 @@ fn main() {
         }
     }
     paths.sort_by_key(|(_, p)| std::cmp::Reverse(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
+    // Allocator policy. Reusing freed heap memory across stages avoids page faults (fresh zeroed
+    // pages) but holds peak RSS near 3x the input size, so only do it when that fits comfortably;
+    // otherwise mmap big buffers so freed memory goes straight back to the OS.
+    {
+        let input: u64 = paths.iter().map(|(_, p)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+        let mem_gb: u64 = std::env::var("MEM_GB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(24);
+        let phys = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) as u64 * libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+        let mem = (mem_gb << 30).min(if phys > 0 { phys } else { u64::MAX });
+        let reuse = input.saturating_mul(3) <= mem / 4 * 3 && std::env::var_os("DS_OLD_MALLOC").is_none();
+        unsafe {
+            if reuse {
+                libc::mallopt(libc::M_MMAP_THRESHOLD, 32 << 20);
+                libc::mallopt(libc::M_TRIM_THRESHOLD, i32::MAX);
+                libc::mallopt(libc::M_TOP_PAD, 64 << 20);
+            } else {
+                libc::mallopt(libc::M_MMAP_THRESHOLD, 128 << 10);
+            }
+        }
+        eprintln!("alloc     {} (input {} MB, budget {} MB)", if reuse { "reuse" } else { "mmap" }, input >> 20, (mem / 4 * 3) >> 20);
+    }
     let next = AtomicUsize::new(0);
     let mapped: Vec<Vec<(u8, &'static [u8])>> = run_par(nt, |_| {
         let mut v = Vec::new();
