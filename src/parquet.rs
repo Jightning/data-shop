@@ -2,7 +2,7 @@
 //! per column, Thrift compact protocol metadata. Supports required/optional UTF8 strings,
 //! required DATE (INT32) and required INT64.
 
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -59,8 +59,8 @@ impl Column {
             Kind::I64 => 2,  // INT64
         }
     }
-    fn page_body(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.data.len() + 16);
+    fn definition_levels(&self) -> Vec<u8> {
+        let mut out = Vec::new();
         if self.optional {
             // RLE/bit-packed hybrid, bit width 1, RLE runs only, 4-byte length prefix.
             let mut lv = Vec::new();
@@ -78,7 +78,6 @@ impl Column {
             out.extend_from_slice(&(lv.len() as u32).to_le_bytes());
             out.extend_from_slice(&lv);
         }
-        out.extend_from_slice(&self.data);
         out
     }
 }
@@ -168,8 +167,9 @@ impl Tw {
 
 /// Writes `cols` (all with `rows` values) as one Parquet file at `path`.
 pub fn write_file(path: &Path, rows: usize, cols: &[Column]) -> std::io::Result<()> {
-    let mut file: Vec<u8> = Vec::new();
-    file.extend_from_slice(b"PAR1");
+    let mut file = BufWriter::new(std::fs::File::create(path)?);
+    file.write_all(b"PAR1")?;
+    let mut offset = 4i64;
     struct Meta {
         offset: i64,
         size: i64,
@@ -177,11 +177,12 @@ pub fn write_file(path: &Path, rows: usize, cols: &[Column]) -> std::io::Result<
     let mut metas = Vec::with_capacity(cols.len());
     for c in cols {
         assert_eq!(c.count, rows, "column {} has {} values, expected {}", c.name, c.count, rows);
-        let body = c.page_body();
+        let defs = c.definition_levels();
+        let body_len = defs.len() + c.data.len();
         let mut h = Tw::new();
         h.i32(1, 0); // DATA_PAGE
-        h.i32(2, body.len() as i32);
-        h.i32(3, body.len() as i32);
+        h.i32(2, body_len as i32);
+        h.i32(3, body_len as i32);
         h.begin(5); // DataPageHeader
         h.i32(1, rows as i32);
         h.i32(2, 0); // PLAIN
@@ -189,10 +190,12 @@ pub fn write_file(path: &Path, rows: usize, cols: &[Column]) -> std::io::Result<
         h.i32(4, 3); // RLE repetition levels
         h.end();
         h.stop();
-        let offset = file.len() as i64;
-        file.extend_from_slice(&h.buf);
-        file.extend_from_slice(&body);
-        metas.push(Meta { offset, size: (h.buf.len() + body.len()) as i64 });
+        file.write_all(&h.buf)?;
+        file.write_all(&defs)?;
+        file.write_all(&c.data)?;
+        let size = (h.buf.len() + body_len) as i64;
+        metas.push(Meta { offset, size });
+        offset += size;
     }
 
     let mut t = Tw::new();
@@ -256,9 +259,8 @@ pub fn write_file(path: &Path, rows: usize, cols: &[Column]) -> std::io::Result<
     t.bin(6, b"shopping-sessions");
     t.stop();
 
-    file.extend_from_slice(&t.buf);
-    file.extend_from_slice(&(t.buf.len() as u32).to_le_bytes());
-    file.extend_from_slice(b"PAR1");
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(&file)
+    file.write_all(&t.buf)?;
+    file.write_all(&(t.buf.len() as u32).to_le_bytes())?;
+    file.write_all(b"PAR1")?;
+    file.flush()
 }

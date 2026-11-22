@@ -87,9 +87,9 @@ fn decimal_pair(word: u64) -> u32 {
     ((word & 0xf) * 10 + ((word >> 8) & 0xf)) as u32
 }
 
-/// Decode and validate the shared F1/F2 prefix.
+/// Decode and validate the shared F1/F2 prefix as UTC midnight and milliseconds since midnight.
 #[inline(always)]
-fn parse_datetime(b: &[u8; 19]) -> Option<i64> {
+fn parse_datetime_parts(b: &[u8; 19]) -> Option<(i64, i64)> {
     let date = u64::from_le_bytes(b[..8].try_into().unwrap());
     let time = u64::from_le_bytes(b[8..16].try_into().unwrap());
     let second = u16::from_le_bytes([b[17], b[18]]) as u64;
@@ -121,7 +121,13 @@ fn parse_datetime(b: &[u8; 19]) -> Option<i64> {
     }
     let days = (year >> 1) as i64 + i64::from(month_start) + i64::from(day_in_month);
     let seconds = (h * 60 + mi) * 60 + s;
-    Some(days * DAY + i64::from(seconds) * 1000)
+    Some((days * DAY, i64::from(seconds) * 1000))
+}
+
+#[inline(always)]
+fn parse_datetime(b: &[u8; 19]) -> Option<i64> {
+    let (midnight, time) = parse_datetime_parts(b)?;
+    Some(midnight + time)
 }
 
 /// Checked F1 parser.
@@ -131,6 +137,125 @@ pub fn parse_ingest(b: &[u8]) -> Option<i64> {
         parse_datetime(prefix)
     } else {
         None
+    }
+}
+
+#[inline(always)]
+fn parse_f1_clock(b: &[u8; 20]) -> Option<i64> {
+    let clock = u64::from_le_bytes(b[11..19].try_into().unwrap());
+    const DIGITS: u64 = u64::from_le_bytes([255, 255, 0, 255, 255, 0, 255, 255]);
+    const SEPARATORS: u64 = u64::from_le_bytes(*b"\0\0:\0\0:\0\0");
+    if (non_digits(clock) & DIGITS) | ((clock ^ SEPARATORS) & !DIGITS) != 0 {
+        return None;
+    }
+    let hour = decimal_pair(clock);
+    let minute = decimal_pair(clock >> 24);
+    let second = decimal_pair(clock >> 48);
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some(i64::from((hour * 60 + minute) * 60 + second) * 1000)
+}
+
+#[inline(always)]
+fn parse_event_with_ingest_date(event: &[u8], ingest: &[u8; 19], midnight: i64) -> Option<i64> {
+    if let Ok(event) = <&[u8; 20]>::try_from(event) {
+        // The shared date and its T separator have already been validated.
+        if event[19] == b'Z' && event[..11] == ingest[..11] {
+            return parse_f1_clock(event).map(|time| midnight + time);
+        }
+    }
+    parse_ts(event)
+}
+
+/// Return the validated ingest and event timestamps, in that order.
+#[cfg(test)]
+#[inline]
+pub fn parse_event_ingest(event: &[u8], ingest: &[u8]) -> (Option<i64>, Option<i64>) {
+    let Ok([prefix @ .., b'Z']) = <&[u8; 20]>::try_from(ingest) else {
+        return (None, parse_ts(event));
+    };
+    let Some((midnight, time)) = parse_datetime_parts(prefix) else {
+        return (None, parse_ts(event));
+    };
+    (
+        Some(midnight + time),
+        parse_event_with_ingest_date(event, prefix, midnight),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CachedDate {
+    prefix_start: u64,
+    prefix_end: u32,
+    midnight: i64,
+}
+
+/// Worker-local cache of validated civil dates in F1 ingest timestamps.
+pub struct CivilDateCache {
+    dates: [CachedDate; 64],
+}
+
+impl CivilDateCache {
+    pub fn new() -> Self {
+        // Every real prefix has a zero fourth byte in prefix_end.
+        Self {
+            dates: [CachedDate {
+                prefix_start: 0,
+                prefix_end: u32::MAX,
+                midnight: 0,
+            }; 64],
+        }
+    }
+
+    #[inline(always)]
+    fn parse_parts(&mut self, b: &[u8; 20]) -> Option<(i64, i64)> {
+        if b[19] != b'Z' {
+            return None;
+        }
+        let prefix_start = u64::from_le_bytes(b[..8].try_into().unwrap());
+        let prefix_end = u32::from_le_bytes(b[8..12].try_into().unwrap()) & 0x00ff_ffff;
+        // Give each day of one month a distinct slot using its two digit bytes.
+        let slot = usize::from((b[8] & 3) << 4 | (b[9] & 15));
+        let date = &mut self.dates[slot];
+        if date.prefix_start == prefix_start && date.prefix_end == prefix_end {
+            return Some((date.midnight, parse_f1_clock(b)?));
+        }
+
+        let (midnight, time) = parse_datetime_parts(b.first_chunk()?)?;
+        *date = CachedDate {
+            prefix_start,
+            prefix_end,
+            midnight,
+        };
+        Some((midnight, time))
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub fn parse_ingest(&mut self, b: &[u8]) -> Option<i64> {
+        let (midnight, time) = self.parse_parts(b.try_into().ok()?)?;
+        Some(midnight + time)
+    }
+
+    /// Return the validated ingest and event timestamps, in that order.
+    #[inline]
+    pub fn parse_event_ingest(
+        &mut self,
+        event: &[u8],
+        ingest: &[u8],
+    ) -> (Option<i64>, Option<i64>) {
+        let Ok(ingest) = <&[u8; 20]>::try_from(ingest) else {
+            return (None, parse_ts(event));
+        };
+        let Some((midnight, time)) = self.parse_parts(ingest) else {
+            return (None, parse_ts(event));
+        };
+        let prefix = ingest[..19].try_into().unwrap();
+        (
+            Some(midnight + time),
+            parse_event_with_ingest_date(event, prefix, midnight),
+        )
     }
 }
 
@@ -228,6 +353,88 @@ pub fn parse_price(b: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_ingest_pair_matches_independent_parsers() {
+        let mut cache = CivilDateCache::new();
+        let mut check = |event: &[u8], ingest: &[u8]| {
+            let expected = (parse_ingest(ingest), parse_ts(event));
+            assert_eq!(
+                parse_event_ingest(event, ingest),
+                expected,
+                "event {event:?}, ingest {ingest:?}"
+            );
+            assert_eq!(
+                cache.parse_event_ingest(event, ingest),
+                expected,
+                "cached event {event:?}, ingest {ingest:?}"
+            );
+            assert_eq!(cache.parse_ingest(ingest), expected.0, "ingest {ingest:?}");
+        };
+
+        let cases = [
+            &b"2028-02-29T00:00:00Z"[..],
+            b"2028-02-29T23:59:59Z",
+            b"2028-02-29T24:00:00Z",
+            b"2028-02-29T23:60:00Z",
+            b"2028-02-29T23:59:60Z",
+            b"2028-03-01T00:00:00Z",
+            b"2028-03-01T00:00:01Z",
+            b"2028-02-29T00:00:00-23:59",
+            b"2028-03-01T00:00:00+00:01",
+            b"2027-02-29T00:00:00Z",
+            b"2027-02-29T19:09:09Z",
+            b"0000-01-01T00:00:00Z",
+            b"0000-01-01T23:59:59Z",
+            b"1969-12-31T23:59:59Z",
+            b"9999-12-31T23:59:59Z",
+            b"1791071890123",
+            b"00000000000000000123",
+            b"9223372036854775807",
+            b"9223372036854775808",
+            b"2028-02-29T12:00:00Z\r",
+            b"",
+        ];
+        for ingest in cases {
+            for event in cases {
+                check(event, ingest);
+            }
+        }
+
+        let sample = b"2028-02-29T12:34:56Z";
+        for i in 0..sample.len() {
+            for byte in 0..=u8::MAX {
+                let mut changed = *sample;
+                changed[i] = byte;
+                check(&changed, sample);
+                check(sample, &changed);
+            }
+        }
+    }
+
+    #[test]
+    fn event_ingest_cache_requires_the_entire_valid_date_prefix() {
+        let mut cache = CivilDateCache::new();
+        let mut empty_prefix = [0u8; 20];
+        empty_prefix[11..].copy_from_slice(b"00:00:00Z");
+        assert_eq!(cache.parse_ingest(&empty_prefix), None);
+
+        // These dates all compete for the same slot. Invalid dates must neither
+        // hit nor replace a previously validated date.
+        for ingest in [
+            &b"2028-02-29T00:00:00Z"[..],
+            b"2027-02-29T00:00:00Z",
+            b"2028-02-29T23:59:59Z",
+            b"2028-03-29T12:30:00Z",
+            b"2000-02-29T08:00:00Z",
+            b"1900-02-29T08:00:00Z",
+            b"2028-02-29t23:59:59Z",
+            b"2028-02-29T00:00:00Z",
+        ] {
+            assert_eq!(cache.parse_ingest(ingest), parse_ingest(ingest));
+        }
+    }
+
     #[test]
     fn forms() {
         let f1 = parse_ts(b"2026-10-03T23:58:10Z").unwrap();

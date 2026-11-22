@@ -1,31 +1,22 @@
 //! Zero-copy byte slices, a fast string hash, and an open-addressing map keyed by byte strings.
 
-/// A byte slice into a leaked mmap (or other 'static memory), 16 bytes, Copy, no lifetime.
+/// A byte slice into a process-lifetime mapping or read buffer.
 #[derive(Clone, Copy)]
-pub struct Bs {
-    pub p: *const u8,
-    pub n: u32,
-}
-unsafe impl Send for Bs {}
-unsafe impl Sync for Bs {}
+pub struct Bs(&'static [u8]);
 
 impl Bs {
-    pub const EMPTY: Bs = Bs { p: std::ptr::null(), n: 0 };
+    pub const EMPTY: Bs = Bs(&[]);
     #[inline(always)]
-    pub fn new(s: &[u8]) -> Bs {
-        Bs { p: s.as_ptr(), n: s.len() as u32 }
+    pub fn new(s: &'static [u8]) -> Bs {
+        Bs(s)
     }
     #[inline(always)]
     pub fn get(self) -> &'static [u8] {
-        if self.n == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(self.p, self.n as usize) }
-        }
+        self.0
     }
     #[inline(always)]
     pub fn is_empty(self) -> bool {
-        self.n == 0
+        self.0.is_empty()
     }
 }
 
@@ -48,6 +39,11 @@ pub fn hash(b: &[u8]) -> u64 {
     if !r.is_empty() {
         h = mix(h, read_partial(r)); // overlapping loads, no memcpy call
     }
+    final_mix(h)
+}
+
+#[inline(always)]
+fn final_mix(mut h: u64) -> u64 {
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
     h ^= h >> 33;
@@ -138,6 +134,69 @@ impl<V: Copy + Default> StrMap<V> {
     }
 }
 
+enum CatalogRows {
+    Dense(Vec<u32>),
+    General(StrMap<u32>),
+}
+
+/// Use a dense index only when every catalog ID has the exact decimal spelling
+/// and its index fits the bounded table derived from the number of catalog rows.
+pub struct Catalog<const FIRST: u8, const SECOND: u8 = 0> {
+    rows: CatalogRows,
+}
+
+impl<const FIRST: u8, const SECOND: u8> Catalog<FIRST, SECOND> {
+    const MISSING: u32 = u32::MAX;
+
+    pub fn new(map: StrMap<u32>) -> Self {
+        let limit = map.len.saturating_mul(2).min(1 << 20);
+        let mut rows = vec![Self::MISSING; limit + 1];
+        let mut used = 0;
+        for slot in map.slots.iter().filter(|slot| slot.used) {
+            let Some(index) = Self::index(slot.k.get()).filter(|&i| i <= limit) else {
+                return Self { rows: CatalogRows::General(map) };
+            };
+            rows[index] = slot.v;
+            used = used.max(index + 1);
+        }
+        rows.truncate(used);
+        Self { rows: CatalogRows::Dense(rows) }
+    }
+
+    #[inline(always)]
+    fn index(key: &[u8]) -> Option<usize> {
+        let digits = if SECOND == 0 {
+            key.strip_prefix(&[FIRST])?
+        } else {
+            key.strip_prefix(&[FIRST, SECOND])?
+        };
+        let (&first, rest) = digits.split_first()?;
+        if digits.len() > 7 || (first == b'0' && !rest.is_empty()) {
+            return None;
+        }
+        let mut value = 0;
+        for &byte in digits {
+            let digit = byte.wrapping_sub(b'0');
+            if digit > 9 {
+                return None;
+            }
+            value = value * 10 + usize::from(digit);
+        }
+        Some(value)
+    }
+
+    #[inline]
+    pub fn get(&self, key: &[u8]) -> Option<u32> {
+        match &self.rows {
+            CatalogRows::Dense(rows) => {
+                let value = *rows.get(Self::index(key)?)?;
+                (value != Self::MISSING).then_some(value)
+            }
+            CatalogRows::General(map) => map.get(hash(key), key),
+        }
+    }
+}
+
 // ------------------------------------------------------------------ inline keys
 
 /// Reads 0..=8 bytes as a little-endian u64 without touching memory outside `s`.
@@ -155,76 +214,137 @@ fn read_partial(s: &[u8]) -> u64 {
     }
 }
 
-/// A byte string of up to 15 bytes stored inline (zero-padded, byte 15 = length), or a
-/// pointer + length into 'static memory for longer strings (byte 15 = 0xFF).
-/// Inline keys compare with one 128-bit comparison and never dereference the input files.
-#[derive(Clone, Copy)]
-#[repr(C, align(8))]
-pub struct Key {
-    b: [u8; 16],
+/// Encode a fixed-prefix ID with an implicit prefix and an inline tag bit.
+#[inline(always)]
+pub(crate) fn pack_prefixed(bytes: &[u8], prefix: u8) -> Option<u64> {
+    let n = bytes.len();
+    if n == 0 || n > 9 || bytes[0] != prefix || bytes[n - 1] == 0 {
+        return None;
+    }
+    let tail = &bytes[1..];
+    let word = if n == 9 {
+        u64::from_be_bytes(tail.try_into().unwrap())
+    } else {
+        read_partial(tail).swap_bytes()
+    };
+    // The high bit must be free for the tag. A nonzero final byte makes
+    // zero padding unambiguous and preserves byte-wise order.
+    (word >> 63 == 0).then_some((word << 1) | 1)
 }
 
-const LONG: u8 = 0xFF;
+/// Packed prefixed ID, or a pointer to a stable byte-slice descriptor.
+#[derive(Clone, Copy)]
+pub struct CompactKey<const PREFIX: u8>(u64);
 
-impl Key {
-    pub const EMPTY: Key = Key { b: [0; 16] };
+pub type UserKey = CompactKey<b'u'>;
+pub type ClickKey = CompactKey<b'k'>;
 
-    #[inline(always)]
-    pub fn new(s: &'static [u8]) -> Key {
-        let n = s.len();
-        let (lo, hi) = if n <= 8 {
-            (read_partial(s), 0u64)
-        } else if n <= 15 {
-            (u64::from_le_bytes(s[..8].try_into().unwrap()), read_partial(&s[8..]))
-        } else {
-            let mut b = [0u8; 16];
-            b[..8].copy_from_slice(&(s.as_ptr() as u64).to_le_bytes());
-            b[8..12].copy_from_slice(&(n as u32).to_le_bytes());
-            b[15] = LONG;
-            return Key { b };
-        };
-        let mut b = [0u8; 16];
-        b[..8].copy_from_slice(&lo.to_le_bytes());
-        b[8..16].copy_from_slice(&hi.to_le_bytes());
-        b[15] = n as u8;
-        Key { b }
+/// Thread-local cursor over fallback descriptors. Published descriptors and
+/// their mapped bytes stay live until process exit. A parser that only sees
+/// inline keys allocates no descriptor storage.
+#[derive(Default)]
+pub struct KeyArena {
+    free: &'static mut [Bs],
+}
+
+impl KeyArena {
+    #[cold]
+    fn refill(&mut self) {
+        self.free = Box::leak(Box::new([Bs::EMPTY; 512]));
     }
 
-    #[inline(always)]
-    pub fn from_bs(s: Bs) -> Key {
-        Key::new(s.get())
+    fn insert(&mut self, bytes: Bs) -> u64 {
+        if self.free.is_empty() {
+            self.refill();
+        }
+        let (slot, rest) = std::mem::take(&mut self.free).split_first_mut().unwrap();
+        self.free = rest;
+        *slot = bytes;
+        (slot as *const Bs).expose_provenance() as u64
     }
+}
 
+impl<const PREFIX: u8> CompactKey<PREFIX> {
+    pub const EMPTY: Self = Self(0);
+
+    /// Return the ID and its hash from a single byte load on the common path.
     #[inline(always)]
-    pub fn get(&self) -> &[u8] {
-        if self.b[15] != LONG {
-            &self.b[..self.b[15] as usize]
+    pub fn hashed(id: Bs, arena: &mut KeyArena) -> (u64, Self) {
+        let bytes = id.get();
+        if let Some(key) = Self::inline(bytes) {
+            (final_mix(key.0), key)
         } else {
-            let p = u64::from_le_bytes(self.b[..8].try_into().unwrap()) as *const u8;
-            let n = u32::from_le_bytes(self.b[8..12].try_into().unwrap()) as usize;
-            unsafe { std::slice::from_raw_parts(p, n) }
+            (hash(bytes), Self(arena.insert(id)))
         }
     }
 
     #[inline(always)]
-    pub fn same(&self, o: &Key) -> bool {
-        if self.b[15] != LONG && o.b[15] != LONG {
-            u128::from_ne_bytes(self.b) == u128::from_ne_bytes(o.b)
+    pub fn new(id: Bs, arena: &mut KeyArena) -> Self {
+        Self::inline(id.get()).unwrap_or_else(|| Self(arena.insert(id)))
+    }
+
+    #[inline(always)]
+    fn inline(bytes: &[u8]) -> Option<Self> {
+        pack_prefixed(bytes, PREFIX).map(Self)
+    }
+
+    #[inline(always)]
+    fn is_inline(self) -> bool {
+        self.0 & 1 != 0
+    }
+
+    #[inline(always)]
+    fn is_empty(self) -> bool {
+        self.0 == Self::EMPTY.0
+    }
+
+    fn fallback_bytes(self) -> &'static [u8] {
+        if self.is_empty() {
+            return &[];
+        }
+        // A nonzero even key came from an aligned, initialized descriptor in
+        // KeyArena. That slot is never mutated again and the chunk stays live.
+        let descriptor = std::ptr::with_exposed_provenance::<Bs>(self.0 as usize);
+        unsafe { (*descriptor).get() }
+    }
+
+    #[inline]
+    pub fn with_bytes<R>(self, f: impl FnOnce(&[u8]) -> R) -> R {
+        if self.is_inline() {
+            let word = self.0 >> 1;
+            let len = 8 - word.trailing_zeros() as usize / 8;
+            let mut bytes = [PREFIX; 9];
+            bytes[1..].copy_from_slice(&word.to_be_bytes());
+            f(&bytes[..len + 1])
         } else {
-            self.get() == o.get()
+            f(self.fallback_bytes())
+        }
+    }
+
+    #[inline]
+    pub fn same(self, other: Self) -> bool {
+        self.0 == other.0
+            || (!self.is_inline() && !other.is_inline() && self.fallback_bytes() == other.fallback_bytes())
+    }
+
+    #[inline]
+    pub fn cmp(self, other: Self) -> std::cmp::Ordering {
+        if self.is_inline() && other.is_inline() {
+            self.0.cmp(&other.0)
+        } else {
+            self.with_bytes(|a| other.with_bytes(|b| a.cmp(b)))
         }
     }
 }
 
 #[derive(Clone, Copy)]
 struct KSlot<V: Copy> {
-    h: u64,
-    k: Key,
+    h: u32,
+    k: UserKey,
     v: V,
-    used: bool,
 }
 
-/// Open-addressing map keyed by `Key` (hash supplied by the caller).
+/// Open-addressing map keyed by `UserKey` (hash supplied by the caller).
 pub struct KeyMap<V: Copy + Default> {
     slots: Vec<KSlot<V>>,
     mask: usize,
@@ -235,24 +355,24 @@ impl<V: Copy + Default> KeyMap<V> {
     pub fn with_capacity(n: usize) -> Self {
         let cap = (n.max(8) * 2).next_power_of_two();
         KeyMap {
-            slots: vec![KSlot { h: 0, k: Key::EMPTY, v: V::default(), used: false }; cap],
+            slots: vec![KSlot { h: 0, k: UserKey::EMPTY, v: V::default() }; cap],
             mask: cap - 1,
             len: 0,
         }
     }
 
     #[inline]
-    pub fn get(&self, h: u64, k: &Key) -> Option<V> {
+    pub fn get(&self, h: u32, k: &UserKey) -> Option<V> {
         if self.len == 0 {
             return None;
         }
         let mut i = (h as usize) & self.mask;
         loop {
             let s = &self.slots[i];
-            if !s.used {
+            if s.k.is_empty() {
                 return None;
             }
-            if s.h == h && s.k.same(k) {
+            if s.h == h && s.k.same(*k) {
                 return Some(s.v);
             }
             i = (i + 1) & self.mask;
@@ -260,19 +380,19 @@ impl<V: Copy + Default> KeyMap<V> {
     }
 
     #[inline]
-    pub fn get_or_insert(&mut self, h: u64, k: Key, v: V) -> (V, bool) {
+    pub fn get_or_insert(&mut self, h: u32, k: UserKey, v: V) -> (V, bool) {
         if (self.len + 1) * 2 > self.slots.len() {
             self.grow();
         }
         let mut i = (h as usize) & self.mask;
         loop {
             let s = &mut self.slots[i];
-            if !s.used {
-                *s = KSlot { h, k, v, used: true };
+            if s.k.is_empty() {
+                *s = KSlot { h, k, v };
                 self.len += 1;
                 return (v, true);
             }
-            if s.h == h && s.k.same(&k) {
+            if s.h == h && s.k.same(k) {
                 return (s.v, false);
             }
             i = (i + 1) & self.mask;
@@ -283,12 +403,12 @@ impl<V: Copy + Default> KeyMap<V> {
         let cap = self.slots.len() * 2;
         let old = std::mem::replace(
             &mut self.slots,
-            vec![KSlot { h: 0, k: Key::EMPTY, v: V::default(), used: false }; cap],
+            vec![KSlot { h: 0, k: UserKey::EMPTY, v: V::default() }; cap],
         );
         self.mask = cap - 1;
-        for s in old.into_iter().filter(|s| s.used) {
+        for s in old.into_iter().filter(|s| !s.k.is_empty()) {
             let mut i = (s.h as usize) & self.mask;
-            while self.slots[i].used {
+            while !self.slots[i].k.is_empty() {
                 i = (i + 1) & self.mask;
             }
             self.slots[i] = s;
@@ -299,18 +419,60 @@ impl<V: Copy + Default> KeyMap<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn keys() {
-        let samples: Vec<&'static [u8]> = vec![
-            b"", b"a", b"ab", b"abc", b"abcd", b"abcde", b"abcdefg", b"abcdefgh", b"abcdefghi",
-            b"abcdefghijklmno", b"abcdefghijklmnop", b"abcdefghijklmnopqrstuvwxyz", b" u1", b"u1 ",
-            b"u1\r", b"U1", b"u1",
+    fn compact_keys_match_byte_slices() {
+        assert_eq!(std::mem::size_of::<UserKey>(), 8);
+        assert_eq!(std::mem::size_of::<KSlot<u32>>(), 16);
+        let samples: &[&'static [u8]] = &[
+            b"", b"a", b"u", b"ua", b"uaa", b"uaaa", b"uaaaa", b"uaaaaa", b"uaaaaaa",
+            b"uaaaaaaa", b"uaaaaaaaa", b"uaaaaaaaaa", b"u0", b"u0 ", b"uA", b"U0",
+            b" u0", b"u0\r", b"u0\0", b"u0\0b", b"u0\0\0", b"u\0b", b"u\0",
+            "ué".as_bytes(), "uaé".as_bytes(), "u你".as_bytes(), b"verylongendoffile",
         ];
-        for &a in &samples {
-            assert_eq!(Key::new(a).get(), a);
-            for &b in &samples {
-                assert_eq!(Key::new(a).same(&Key::new(b)), a == b);
+        let mut arena = KeyArena::default();
+        for &a in samples {
+            let (ha, ka) = UserKey::hashed(Bs::new(a), &mut arena);
+            ka.with_bytes(|bytes| assert_eq!(bytes, a));
+            for &b in samples {
+                let (hb, kb) = UserKey::hashed(Bs::new(b), &mut arena);
+                assert_eq!(ka.same(kb), a == b, "{a:?} {b:?}");
+                assert_eq!(ka.cmp(kb), a.cmp(b), "{a:?} {b:?}");
+                if a == b {
+                    assert_eq!(ha, hb);
+                }
             }
         }
+        let click = ClickKey::new(Bs::new(b"k01234567"), &mut arena);
+        click.with_bytes(|bytes| assert_eq!(bytes, b"k01234567"));
+    }
+
+    #[test]
+    fn fallback_keys_survive_arena_refill_and_drop() {
+        let key = {
+            let mut arena = KeyArena::default();
+            let first = UserKey::new(Bs::new(b"Ueof"), &mut arena);
+            for _ in 0..1025 {
+                UserKey::new(Bs::new(b"ua00000000000000000"), &mut arena);
+            }
+            first
+        };
+        key.with_bytes(|bytes| assert_eq!(bytes, b"Ueof"));
+    }
+
+    #[test]
+    fn key_map_keeps_hash_collisions_and_grows() {
+        let mut arena = KeyArena::default();
+        let mut map = KeyMap::with_capacity(0);
+        for index in 0..512 {
+            let bytes = Box::leak(format!("u{index}").into_bytes().into_boxed_slice());
+            let key = UserKey::new(Bs::new(bytes), &mut arena);
+            assert_eq!(map.get_or_insert(1, key, index), (index, true));
+            assert_eq!(map.get(1, &key), Some(index));
+        }
+        let fallback = UserKey::new(Bs::new(b"u1\0"), &mut arena);
+        assert_eq!(map.get_or_insert(1, fallback, 512), (512, true));
+        let fallback2 = UserKey::new(Bs::new(b"u1\0"), &mut arena);
+        assert_eq!(map.get(1, &fallback2), Some(512));
     }
 }
