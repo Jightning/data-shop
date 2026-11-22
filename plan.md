@@ -1,48 +1,97 @@
-# Prompts
-Lets run these in order (the prompts are the ones inside the ```)
+# Shopping Sessions performance plan
 
-# Step 1
-```txt
-Inspect this repository and `../local-data/` via shell commands (read `AGENTS.md`, `rules.md`, starter `Makefile`, and test scripts).
+## Two-hour sprint to 400 ms
 
-Build the harness:
-1. `scripts/verify.sh` with 4 subcommands (fail fast with non-zero exit on any error):
-   - `correct`: builds `--release`, runs all 36 fixtures, runs the 1M dev diff against `../local-data/dev_1m` and `../local-data/dev-answer`, verifies `stdout` is 0 bytes, and checks the `rules.md` table invariants (matching total `sessions` and `revenue_cents`, and `assisted_sessions >= non-organic sessions`).
-   - `bench20`: runs 3 iterations against `../local-data/bench_20m` (clearing output/scratch between runs), prints each run's wall time in ms, the median, and the median run's `stderr` stage timings. If `perf` is available and permitted, include a 1-run `perf stat` summary (cycles, instructions, LLC-load-misses, page-faults, context-switches).
-   - `stress60`: runs once against `../local-data/stress_60m` measuring wall time and peak RSS; fails if peak RSS > 18 GB or wall time > 90s.
-   - `docker`: builds `linux/amd64` and runs the exact grader container mirror (`--cpus=8 --memory=24g --memory-swap=24g --read-only --tmpfs /tmp:size=64m --network none --user 1000:1000` with `DATA_DIR`, `OUTPUT_DIR`, `SCRATCH_DIR`, `HOME`, `NCPU`, `MEM_GB`) against `dev_1m` and reports container wall time.
-2. `.gitignore`, `.dockerignore` (exclude `target/`, `.git/`, `fixtures/`, `scripts/`, `results.tsv`), and `results.tsv` with header row.
-3. Check if `../local-data/{dev_1m,bench_20m,stress_60m}` exist; if missing and `../local-data/generator` is present, compile the generator and create them using the exact `--clicks` ratio from the starter `Makefile`.
+Use this sprint schedule for the current deadline. The 250 ms figure in AGENTS.md is the longer-term stretch goal. From the reported 2.39 s, 400 ms requires roughly 6× throughput. The fastest saved internal run spent 800 ms on events and 1,162 ms elsewhere. Even eliminating both events and resolve would leave roughly 919 ms on that run. A scanner win alone cannot close the gap. Prefer experiments that remove full-data passes and reduce bytes per event across several stages.
 
-Make `scripts/verify.sh` executable, validate its syntax, and confirm readiness. Do not push.
+Run three agents from the same starting source revision. The lead owns src/main.rs, integration, results.tsv, and all performance measurements. The CSV worker owns src/csvp.rs. The timestamp worker owns src/ts.rs. Give each worker an isolated worktree/checkout, branch, Cargo target directory and VERIFY_WORK directory. Point LOCAL_DATA, FIXTURES and PYTHON at the original checkout's absolute paths. Keep current public parser entry points compatible so either patch can land alone. Workers return commit hashes to the lead; the lead cherry-picks. Only the lead changes call sites. Run builds and tests during development windows, then idle both workers' CPU-heavy jobs for timed runs. Pause gaming for decision runs or label noisy results provisional. No worktree isolation can eliminate shared memory-bandwidth contention.
+
+| Elapsed | Lead action and decision |
+|---|---|
+| 0–15 min | Set one absolute deadline; inspect dirty state and preserve the starting binary. Start both parser workers immediately. Measure pinned host bench20 and a real 20M container launch using the docker harness flags plus cpuset. Record external wall minus internal total on the same run. If repeatable launch/exit overhead alone exceeds 400 ms, keep improving external wall and report the local timing floor. |
+| 15–55 min | Lead owns the data path. Prototype direct canonical scatter for clicks and events, then skip DEAD entries before person counts and scatter. Preserve exact global winner selection including invalid early copies. Estimate bytes and stage time removed; if early lookups erase the gain, keep raw-user locality and compact the payload crossing resolve instead. Workers build parser patches in parallel. |
+| 55–85 min | Integrate ready patches; run correct before timing each candidate batch. Compare saved baseline and candidate in quiet AB/BA pairs on identical cores and mounts. If a batch regresses, time the parser pair and main change separately. Keep the fastest correct combination. Use extra pairs only if the margin competes with baseline noise. Log every tested batch. |
+| 85–100 min | Recalculate the gap from measured wall. Choose one follow-up that can materially close it: for person/grouping time, remove a full grouping pass or shrink records; for load time, compare demand mapping against MAP_POPULATE and include faults during parsing; for compute-bound events, integrate the best remaining parser change. Skip knob sweeps whose whole stage is smaller than the gap unless they are the best remaining gain. |
+| 100–120 min | Freeze candidates early enough to finish checks. Run stock bench20, stress60 with STRESS_MAX_S=60, docker dev diff and repeated pinned 20M container runs. Report every external wall time and median, plus stress RSS/time and delta vs the same-host starting build. Retain the fastest fully verified commit if a later candidate fails. Record next= in results.tsv if the deadline arrives first. |
+
+Spend the risk budget on disposable branches, specialized implementation and a larger coherent batch. Keep unmeasured alternatives off the production hot path. A speed claim requires end-to-end evidence; a result near 400 ms merits additional independent runs. This schedule takes precedence over the exploratory tuning grid and seven-pair screening protocol for this sprint.
+
+## Budget and evidence
+
+The reported leaderboard result is 2.39 s, rank 180/367. The target is under 250 ms from container start to exit on eight pinned vCPUs, a 9.56× improvement. The checkout has roughly 1.90 GB of 20M input. Reading it once in 250 ms requires 7.6 GB/s before accounting for intermediate writes, reads, output and startup. Measure an eight-thread sequential scan with a consumed checksum against the same mount and cache state, and time a minimal process in the same image/runtime separately. If startup takes S seconds, the input rate needed is at least 1.90/(0.25 − S) GB/s. If cold storage or launch alone exhausts the budget, report that measured floor and keep optimizing the scored path.
+
+Existing evidence at HEAD 7b6c36f (E7 source at e871e41). The following are saved process timers in target/verify, rounded to ms. Their build and affinity are unverified. They establish a profiling order. The scoreboard, historical bench20 wall medians and saved internal totals measure different runs.
+
+| Saved 20M run | Load | Links | Events | Clicks | Dedup | Resolve | Persons incl. user write | Campaign | Internal total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 |70|184|1328|344|91|303|385|5|2710|
+| 2 |538|293|1346|213|103|243|317|3|3056|
+| 3 |89|186|800|176|109|244|353|5|1962|
+
+Even deleting the entire events stage in run 3 leaves about 1.16 s. results.tsv records a 1742 ms E7 bench median and no E7 stress RSS. The saved stress.time shows 10.66 s and 10,541,108 KiB RSS. Re-establish paired measurements on the intended host. E2 reduced faults but suffered a 935 s THP stall. E4's combined scalar CSV/date-cache change regressed. Keep E3's sub-bucketing, E5's conditional allocator reuse and E6's direct scatter as controls.
+
+## Micro experiments, in profiling order
+
+| Location | Candidate and mechanism | Measurement and correctness discriminator |
+|---|---|---|
+| src/csvp.rs, for_records | The SSE2 loop loads 64 bytes but enumerates every quote and reloads each matched byte to classify it. First compare two AVX2 loads with identical logic. Independently retain separate delimiter and quote masks, iterating delimiters and verifying quotes only at both ends of a field with zero interior quotes. Keep masks local to the block. | Cycles/byte and branches/row on event and click chunks including malformed rows. Carry field state across blocks, check tails without overread, count excess fields, preserve CR, spaces, empty quoted values and final unterminated line. Dispatch once per chunk or process with exact feature checks. Compare emitted fields to split on every alignment. [Structural indexing research](https://arxiv.org/abs/1902.08318) |
+| src/ts.rs and event callback | Ingest is guaranteed F1. Give it a dedicated fixed-position decoder. For event/click times try a guarded 13-digit F3 reduction using packed ASCII validation and fixed pairs of digits. Separately compare a small manifest-derived table of valid date prefixes to days since epoch. | Count format hits and fallback cost; compare cycles for parsing two timestamps per event. Check all punctuation, offset ranges, leap days, UTC date crossings and long leading-zero F3. Fall back for dates outside the table, including ingest dates. E4 does not isolate the date change. |
+| src/util.rs and event emission | Measure hashing plus Key construction together. Reuse loaded short-ID bytes for hashing and packing. Compare a compact reversible representation for generated base36 event IDs against existing inline keys only if saved D bytes outweigh decoding. | Generator user.rs and text.rs produce scrambled base36 IDs. Accept only canonical, overflow-checked spelling and actual prefix. Preserve exact equality across representations, leading zeros, arbitrary lengths and case. Numeric order cannot implement byte-wise click ties. Track size_of, probes, bytes/row, fallback frequency. |
+| main.rs lookup tables | The product lookup already runs only for purchases. Test a lookup built from actual campaign rows for canonical c_<decimal> keys and an equivalent product index if warranted. Bound index density and allocation; general keys use the existing map. | Favor clicks first. Measure validated hits, index occupancy and wall time. Sparse IDs, alternate spelling and holes must retain exact unknown behavior. |
+| main.rs load, new_bufs, run_par | Cache file lengths before sorting paths (the comparison key does metadata I/O), reuse size for planning. Measure vector capacity vs populated length by worker and partition. Reserve according to sampled record widths. Try worker reuse across barriers only if creation or allocator churn is measurable. | Count metadata calls, allocated bytes, minor/major faults and idle time. Separate mapping, prefault and first consumption. Never release mapped storage while long Key/Bs references remain live. |
+| main.rs build_links | Time endpoint interning, pair reconstruction, serial union/find, and final serial materialization separately. Compare union-by-size plus a separate minimum-ID array with current path-halving/minimum-root scheme. Parallelize final partition materialization first if it dominates. | Measure maximum tree depth and serial ms. Include a 400-hop reversed chain, a shared device, repeats and a minimum absent from events. |
+| main.rs dedup and resolve | The 16-way split rereads and copies every 40-byte D. Bypass secondary scatter for small buckets already fitting cache. Try compact handles or split hot hashes/indexes from cold full IDs. Batch lookup/prefetch only on high-miss partitions. | Track probe lengths, LLC misses, copied bytes and wall. Compare full ID on hash match; keep invalid winners with NONE, and mark losers only with stable disjoint locations. |
+| Worker::partition and person | Accumulate event counts when recording pid to remove one pass. Reuse click counts; measure zero-initializing se/sc before exact scatter. For one session, compute qualifying campaigns using a generation-stamped array or small list instead of re-sorting by campaign. | Record person size histograms weighted by rows, sort and assist CPU time, worst worker tail. Every scatter slot must be initialized once before exposing it. Keep merged coverage for high fan-out, inclusive endpoints, and handle stamp wrap. |
+| Worker::write_users and parquet.rs | Worker columns are re-encoded, page bodies assembled, then copied into a whole-file Vec. Stream header/body to a buffered writer with a running offset. Next try emitting finished user-day rows directly into bounded column buffers. Consider dictionary encoding just top_category if output bytes dominate. | Split encode/write from persons; measure output bytes, RSS and wall. Check footer offsets, nullable levels, empty tables and DATE with the reference reader. Keep wide revenue totals. [Parquet encoding specification](https://parquet.apache.org/docs/file-format/data-pages/encodings/) |
+| Acc and campaign output | Dense worker-local campaign/day counters already fall back to sparse above 2^18 cells. Try touched-cell merge for sparse occupancy in a dense allocation; use checked dimension multiplication and budget across workers. | Saved campaign stage is under 5 ms. Defer unless wider windows, RSS or profiles promote it. Preserve assist-only rows and organic zeros. |
+
+## Architecture and high-leverage alternatives
+
+Today the process loads dimensions and prefaults mappings, interns link endpoints by hash partition, serially unions global IDs, then builds immutable alias maps. Event scanning produces both a dedup record keyed by event ID and a speculative valid payload partitioned by raw user. Clicks scatter by raw user. Global event dedup invalidates losers in place. Resolve reads both payload streams, maps aliases and scatters again by canonical person. Each person partition interns names again, counts and scatters into contiguous arrays, sorts each person's events and clicks, then aggregates. Largest event partitions start first. Workers write user Parquet in parallel and main merges campaign totals. Identical click duplicates already have no effect on credit or merged assist intervals.
+
+1. **Fuse resolve into parsing.** Links are immutable before scanning starts. For valid copies, resolve the raw user immediately and scatter to the canonical-person partition. Store that partition's stable location in D. Finish global event-ID dedup and skip DEAD at person grouping. Route clicks directly too. First test clicks alone to quantify the extra random alias lookups; then events. Compare events + clicks + dedup + resolve + persons together. A worker-local exact alias cache may recover locality lost by removing the raw-user partition pass. Cross-user duplicates still compete globally.
+2. **Carry integer person handles.** Retain the DSU's dense component index and a name dictionary; for unlinked IDs build exact partition-local dictionaries with disjoint namespaces. Route all occurrences of an unlinked ID to one owner before assigning its handle. Derive offsets from compact handles, replacing repeated full-name hashing and wide PE records. Compare first with fused resolution, then with existing partition-local resolution. Include dictionary build, skew, and overlap of old and new buffers in RSS.
+3. **Change dedup ownership if writes still dominate.** Test a one-sided, two-pass duplicate detector. In pass one route every structurally eligible ID to a deterministic owner and mark *possibly repeated* keys with a membership filter plus a candidate set. Pass two sends every copy of a candidate, including its first occurrence and invalid copies, to exact earliest-ingest selection. Definitely unique rows can proceed directly. Never allow false negatives from concurrent filter updates or inconsistent hashing. Budget two full input scans and candidate storage against the existing D stream; abandon if the scan floor already loses. Simpler control: retain exact D but shrink the ID/locator footprint.
+4. **Balance the long tail.** Time each person partition, including its largest single person. For whale-only sort hotspots, sort disjoint runs in spare workers then merge chronologically before one session sweep. Keep ordinary users on the current per-person comparison sort. Also compare radix sorting compact time offsets for large people with a wide timestamp fallback. Shared devices can merge thousands of IDs. Splitting by alias or UTC day independently would break cross-midnight sessions and assists.
+5. **Overlap only independent work.** The current raw-user parser does not need links until resolve. Compare a shared bounded task pool processing link chunks and CSV chunks, then joining at resolve, versus serial phases and fused resolve. Respect NCPU across all tasks. Measure memory-bandwidth saturation and peak live memory; this schedule competes with early canonicalization. Stream finished user partitions to bounded output shards if output or allocator peaks dominate.
+
+## Test-dependent tuning protocol
+
+Use the following grids as screening candidates. Choose one row according to current evidence. Start at the existing value, test the nearest lower and higher alternatives, expand in the winning direction, and stop after two losing neighbors or the end of the grid.
+
+| Knob | Candidate values | Coupling to check |
+|---|---|---|
+| Scanner | SSE2, runtime AVX2, runtime AVX-512BW where supported | Cross the best two with combined vs separate quote masks; retain scalar tail and supported baseline. |
+| Partition geometry | Primary 64/128/256; secondary 1/4/8/16/32 | Vary primary hash shift and secondary bits without overlap. Current loc encodes 8 partition bits. Test 512 only after widening or replacing locator. Compare cache working set against scatter fan-out. |
+| Chunk scheduling | 256 KiB, 1, 4, 8 MiB vs current adaptive sizing | Compare worker utilization at 1/4/8 workers for diagnosis; eight pinned CPUs for selection. Split only at row boundaries. |
+| Mapping/heap | Current MAP_POPULATE, demand mmap, bounded sequential read buffers; allocator reuse enabled vs existing fallback | Separate warm and first-run results, measure faults and RSS. Owned input backing must outlive all borrowed keys. Exclude forced THP after E2. |
+| Grouping/assists | Small-person cutoffs 4/8/16/32 clicks, whale sort cutoffs 1K/8K/64K events | Compare to current algorithm, measure by observed group sizes and interaction with compact handles. |
+| Writer | Current per-worker file vs 32K/128K/512K-row shards | Compare copies, file count, output bytes and reader diff; keep valid empty schema when all rows drop. |
+
+1. Snapshot commit, dirty paths, toolchain, allocator mode, input bytes, CPU model/ISA, affinity, filesystem, memory ceiling, cache condition and perf availability. Select eight allowed CPUs with consistent topology. Set NCPU=8 and MEM_GB=24. Use the read-only local/generator sources when ../local-data is absent. Use existing datasets; place any independent-seed outputs in writable scratch outside local/.
+2. Preserve baseline and candidate release binaries separately. After each code edit run `PYTHON="$PWD/.venv/bin/python" bash scripts/verify.sh correct` before benchmarking. For parser changes also run cargo test and differential checks against the scalar path across SIMD boundaries. For representation changes compare independent seeds and adversarial IDs, long windows and header-only inputs against the reference. Guard category counts too: current u16 category casts require a wide fallback if the dictionary exceeds the representable range.
+3. Run the stock bench20 for the baseline. Profile the largest stage with per-thread local counters aggregated at barriers. Separate CSV/ts/hash/scatter via sampling or replay of the same chunks in scratch; avoid a per-row timer. Record instructions/byte, IPC, branches, LLC misses, faults, max worker ms and actual capacity × element size. Retain uninstrumented wall time for decisions. If perf is unavailable, use stage timers, GNU time and paired runs.
+4. Estimate noise with unchanged A/A binaries. For one knob, screen with three balanced-order pairs, then confirm the best against baseline with at least seven fresh alternating AB/BA pairs. Use fresh output directories and identical mount/cache policy each run. Keep raw external ms and paired differences. Require median wall gain larger than A/A noise and a majority of winning pairs on a held-out run set. If inconclusive, extend pairs once or revert. Retest the best two knobs together as a 2×2 matrix if they share a cache, layout or bandwidth cost. Avoid choosing a seed-specific threshold.
+5. Rerun stock bench20 for the winner. Run `STRESS_MAX_S=60 bash scripts/verify.sh stress60` on layout/scheduling changes and final candidates; explicitly require wall <60 s and RSS <18,000,000,000 bytes (the harness accepts equality). Run docker on dev for exact outputs and ISA/startup checks. The harness docker command uses CPU quota and dev data; separately repeat its run flags with the 20M input, explicit eight-CPU cpuset and fresh output. Time container invocation to exit, excluding image build, recording raw times. Label host, container, warm and first-run results separately.
+
+## Paste-ready prompts
+
+### Lead / integration agent — start first
+
+```text
+You have two hours to reach <400 ms container start-to-exit on 20M events, eight pinned vCPUs, exact rules.md outputs, and <18 GB RSS and <60 s on 60M. Start the clock. Follow AGENTS.md and the “Two-hour sprint to 400 ms” section in plan.md. Use the two parser worker prompts in that file to delegate if workers have not already been launched. Start all three lanes from the same revision; give workers isolated checkouts and build/verify directories.
+
+Own src/main.rs, all integration, results.tsv and timing. Preserve the starting binary; establish pinned host and container baselines. Attack whole-record traffic and canonical scatter while workers optimize parsing. Batch compatible wins, run correct before timing, use quiet paired runs, and take the next experiment directly from measured costs. Log each tested batch and next= in results.tsv. Reserve the final 20 minutes for stress60 and container verification. Return the fastest verified commit, measured wall times, RSS, and remaining gap. Never push.
 ```
 
-# Step 2
-```txt
-Read `AGENTS.md`, `rules.md`, and `../local-data/generator/` from disk.
+### CSV worker — separate checkout
 
-Design and build a standalone, ultra-low-latency Rust solution (or static C++ if you judge it strictly faster for our custom SIMD + Parquet pipeline—pick one and justify briefly) targeting < 0.25s on 20M events after tuning. Skip naive prototypes and build the right foundation on v1:
-- Static `linux/amd64` binary in a `FROM scratch` (or minimal) Dockerfile; call `_exit(0)` after flushing outputs.
-- Zero per-row heap allocations: byte-chunked parallel I/O across all `NCPU` threads, custom byte-level CSV & SWAR F1/F2/F3 timestamp parsers (fast paths with exact general fallbacks), radix-partitioned L2/L3-resident `event_id` dedup, unlinked-user hashing without global interning contention, flat contiguous per-person slices, whale-first scheduling, and linear $O(C + S)$ sliding-window attribution/assists.
-- Minimal hand-written uncompressed Parquet writer (each worker writes its own `user_daily` shard lock-free; single merged `campaign_daily` file).
-- Microsecond per-stage timing breakdown printed to `stderr`; zero bytes to `stdout`.
-
-Run `bash scripts/verify.sh correct`, `bash scripts/verify.sh bench20`, `bash scripts/verify.sh stress60`, and `bash scripts/verify.sh docker`. Iterate until all four pass, log the baseline in `results.tsv`, and commit locally. Do not push.
+```text
+Own only src/csvp.rs in your assigned checkout. Optimize for_records for the event and click shapes described in rules.md. Compare cheaper structural-mask iteration with runtime-dispatched AVX2; preserve the existing interface and exact baseline path. Check quoted/malformed fields, literal CR, long rows, EOF and SIMD boundaries against split. Use your own build/verify directories. Run cargo test and verify.sh correct; send the lead a cherry-pickable commit, test outcome and ISA details by minute 55. The lead owns benchmarks and results.tsv. Coordinate CPU-heavy work around the lead's quiet runs. Never push.
 ```
 
-# Step 3
-```txt
-Gather full state via commands:
-- `git log -n 10 --oneline`
-- `cat results.tsv`
-- `bash scripts/verify.sh bench20`
+### Timestamp worker — separate checkout
 
-You have full architectural autonomy to drive `bench20` well below 290 ms (target < 200–250 ms) without breaking `rules.md` or exceeding 18 GB peak RSS on 60M. Inspect `src/`, `Dockerfile`, and `../local-data/generator/` as needed.
-
-Run a focused optimization sprint (up to 4 keep/revert experiments):
-- Use the real `bench20` stage timings and hardware counters (`perf` / flamegraph / custom instrumentation if helpful) to attack the largest remaining latency contributors—whether that is I/O page faults (`pread` vs `mmap` + `MADV_HUGEPAGE`/`WILLNEED`), runtime-dispatched AVX2/AVX-512 parsing, radix partition sizing/prefetching, hash table layout, false sharing, sorting, Parquet serialization, or container/binary startup overhead.
-- After every edit: run `bash scripts/verify.sh correct` before benchmarking. Run `bash scripts/verify.sh stress60` whenever memory layout changes.
-- Commit real wins and cleanly revert anything that doesn't improve speed or simplify code. Log every attempt in `results.tsv`.
-
-Do not modify read-only files and do not run `git push`. Report the final `bench20` median, per-stage breakdown, and the next biggest bottleneck.
+```text
+Own only src/ts.rs in your assigned checkout. Speed the common F1 ingest and F1/F3 event cases; preserve the parse_ts API and exact F2, Gregorian and arbitrary-length digit handling. You may expose a dedicated guaranteed-F1 ingest function. Tell the lead its signature and exact call site; the lead owns main.rs. Use your own build/verify directories. Run cargo test and verify.sh correct, including targeted differential cases for your new path. Send a cherry-pickable commit and test outcome by minute 55. The lead owns benchmarks and results.tsv. Coordinate CPU-heavy work around quiet runs. Never push.
 ```

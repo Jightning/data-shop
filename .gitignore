@@ -3,3 +3,11 @@ out/
 dev/
 .DS_Store
 __pycache__/
+
+/.venv/
+/local/dev_1m/
+/local/dev_1m.partial/
+/local/bench_20m/
+/local/bench_20m.partial/
+/local/stress_60m/
+/local/stress_60m.partial/
