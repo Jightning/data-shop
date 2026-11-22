@@ -6,3 +6,4 @@ a14b08d	KEEP	1774	10738	events	E3 dedup buckets split 16 ways (L2-resident u32 t
 89c004d	REVERT	1675	-	events	E4 single-pass CSV split (quote check in comma loop) + 64-entry validated-date cache: alternating A/B x7 events 448->476ms, wall 1636->1675ms = no gain
 8d4bc32	KEEP	1592	10735	events	E5 memory-aware malloc reuse (32MB mmap threshold, no trim when input*3 <= 75% of min(MEM_GB,phys)); A/B x7 1638->1462ms, faults 1.24M->0.79M; forced reuse at 60M = 14.4GB so 60M falls back locally
 c848498	KEEP	1738	11628	events	E6 valid events scattered straight to user buckets + 40B dedup records marking losers DEAD in place; A/B x7 dedup 221->65ms, wall 1537->1408ms; faults 0.79M->0.71M (3-run bench20 noisy: 1738)
+e871e41	KEEP	1742	-	events	E7 SSE2 64-byte structural CSV scanner (newline/comma/quote masks) + memcpy-free hash tail; A/B events 696->595ms (-15%, 3 rounds), wall 1810->1742ms; fuzz-tested vs split
