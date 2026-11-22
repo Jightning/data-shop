@@ -1,20 +1,19 @@
 //! Shopping Sessions: rules.md pipeline.
 //!
 //! Stages (each timed to stderr in microseconds; stdout stays empty):
-//!   load     manifest, products, campaigns; mmap every CSV in parallel
-//!   links    parallel parse, hash-partitioned ID interning, union-find (root = byte-wise
-//!            smallest ID), per-partition lookup tables small enough to stay cache-resident
-//!   events   parallel chunked parse + per-copy validation, radix-scattered by hash(event_id)
-//!   clicks   parallel chunked parse + validation, scattered by hash(user_id)
-//!   dedup    per event_id partition: keep the smallest ingest_ts copy, scatter by hash(user_id)
-//!   resolve  per user_id partition: map each ID to its person via that partition's link table,
-//!            move only events and clicks that change partition
-//!   persons  per person partition (largest first): sessionize, credit, assists, user_daily shard
-//!   campaign merge per-worker campaign/day counters, write campaign_daily
+//!   load     manifest, products, campaigns, and read-only CSV mappings
+//!   links    parallel parse and hash-partitioned endpoint interning
+//!   events   validate copies and scatter by raw user and event ID. Link union and
+//!            canonical naming overlap this scan.
+//!   clicks   validate and scatter by raw user
+//!   dedup    keep the smallest ingest timestamp for each event ID
+//!   resolve  assign canonical identities and move records that change partition
+//!   persons  group, sessionize, credit, and write user_daily shards
+//!   campaign merge per-worker campaign/day counters and write campaign_daily
 //! then `_exit(0)`.
 //!
-//! IDs up to 15 bytes are stored inline in 16-byte `Key`s, so after parsing no stage touches
-//! the input files again; longer IDs keep a pointer into the mmap (exact general fallback).
+//! Short user and click IDs are inline. Event dedup IDs and long keys can
+//! reference the read-only input, so mappings stay live through aggregation.
 
 mod csvp;
 mod parquet;
@@ -119,15 +118,16 @@ impl D {
     }
 }
 const NONE: u64 = u64::MAX;
-/// Reserved price for a valid copy that lost to an earlier ingest.
+/// Reserved price for an event eliminated by dedup or moved to another partition.
 const DEAD: u32 = u32::MAX;
 /// A resolved event whose hash field now holds a canonical name index.
 const LINKED: u32 = 1 << 31;
 const NO_PERSON: u32 = u32::MAX;
-/// The highest campaign index is reserved for organic and cannot appear in a click.
+/// Clicks cannot use u32::MAX because an index is reserved for organic.
 const MOVED_CLICK: u32 = u32::MAX;
 
-trait Stamp: Copy + Send {
+/// Common windows use offsets from a shared origin. Wide windows keep epoch milliseconds.
+trait Stamp: Copy + Default + Ord + Send {
     fn encode(ts: i64, origin: i64) -> Self;
     fn decode(self, origin: i64) -> i64;
 }
@@ -178,17 +178,17 @@ struct PC<T> {
 }
 
 /// Per-person compact event for sorting.
-#[derive(Clone, Copy, Default)]
-struct SE {
-    ts: i64,
+#[derive(Clone, Copy)]
+struct SE<T> {
+    ts: T,
     price: u32,
     cat: u32,
 }
 
 /// Per-person compact click for sorting.
 #[derive(Clone, Copy)]
-struct SC {
-    ts: i64,
+struct SC<T> {
+    ts: T,
     id: Key,
     camp: u32,
 }
@@ -229,6 +229,13 @@ struct Links {
     names: Vec<Vec<Key>>,
 }
 
+struct LinkEndpoints {
+    pair_ids: Vec<u64>,
+    base: Vec<usize>,
+    keys: Vec<Key>,
+    maps: Vec<KeyMap<u32>>,
+}
+
 fn run_par<R: Send>(nt: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     std::thread::scope(|s| {
         let f = &f;
@@ -256,7 +263,7 @@ fn leak_read(path: &Path) -> &'static [u8] {
     }
 }
 
-/// mmap a file read-only (pages populated by the calling thread); the mapping is never unmapped.
+/// Map a file read-only; first consumers fault in its pages.
 fn map_file(path: &Path) -> &'static [u8] {
     use std::os::unix::io::AsRawFd;
     let f = match std::fs::File::open(path) {
@@ -272,7 +279,7 @@ fn map_file(path: &Path) -> &'static [u8] {
             std::ptr::null_mut(),
             len,
             libc::PROT_READ,
-            libc::MAP_PRIVATE | libc::MAP_POPULATE,
+            libc::MAP_PRIVATE,
             f.as_raw_fd(),
             0,
         );
@@ -283,21 +290,25 @@ fn map_file(path: &Path) -> &'static [u8] {
     }
 }
 
-fn list_csv(dir: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let name = e.file_name();
+fn list_csv(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut files: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
                 let name = name.to_string_lossy();
-                name.ends_with(".csv") && !name.starts_with('.') && e.path().is_file()
+                if !name.ends_with(".csv") || name.starts_with('.') {
+                    return None;
+                }
+                let path = entry.path();
+                let metadata = std::fs::metadata(&path).ok()?;
+                metadata.is_file().then_some((path, metadata.len()))
             })
-            .map(|e| e.path())
             .collect(),
         Err(_) => Vec::new(),
     };
-    v.sort();
-    v
+    files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    files
 }
 
 /// Splits each file's data (after its header line) into line-aligned chunks of ~`target` bytes.
@@ -364,7 +375,7 @@ fn new_bufs<T>(rows: usize, nt: usize) -> Vec<Vec<T>> {
 
 // ------------------------------------------------------------------ links
 
-fn build_links(files: &[&'static [u8]], target: usize, nt: usize) -> Links {
+fn parse_links(files: &[&'static [u8]], target: usize, nt: usize) -> LinkEndpoints {
     // A: parse; scatter each ID occurrence by hash partition.
     #[derive(Clone, Copy)]
     struct Occ {
@@ -408,15 +419,20 @@ fn build_links(files: &[&'static [u8]], target: usize, nt: usize) -> Links {
         }
     }
     if npairs == 0 {
-        return Links {
-            aliases: (0..PB).map(|_| LinkPart { map: KeyMap::with_capacity(0), persons: Vec::new() }).collect(),
-            names: (0..PB).map(|_| Vec::new()).collect(),
+        return LinkEndpoints {
+            pair_ids: Vec::new(),
+            base: vec![0; PB],
+            keys: Vec::new(),
+            maps: (0..PB).map(|_| KeyMap::with_capacity(0)).collect(),
         };
     }
 
-    // B: per partition, intern distinct IDs (local index per occurrence).
+    // B: intern IDs and record each pair endpoint as (partition, local ID)
+    // in the same pass. Each input occurrence owns exactly one output slot.
+    let mut pair_ids = vec![0u64; npairs * 2];
+    let endpoints = SyncPtr(pair_ids.as_mut_ptr());
     let next = AtomicUsize::new(0);
-    let interned: Vec<Mutex<Option<(KeyMap<u32>, Vec<Key>, Vec<u32>)>>> = (0..PB).map(|_| Mutex::new(None)).collect();
+    let interned: Vec<Mutex<Option<(KeyMap<u32>, Vec<Key>)>>> = (0..PB).map(|_| Mutex::new(None)).collect();
     run_par(nt, |_| loop {
         let p = next.fetch_add(1, Relaxed);
         if p >= PB {
@@ -425,106 +441,91 @@ fn build_links(files: &[&'static [u8]], target: usize, nt: usize) -> Links {
         let n: usize = occ_parts[p].iter().map(|v| v.len()).sum();
         let mut map: KeyMap<u32> = KeyMap::with_capacity(n / 2 + 8);
         let mut keys = Vec::new();
-        let mut locals = Vec::with_capacity(n);
-        for v in &occ_parts[p] {
-            for o in v {
+        let partition_bits = (p as u64) << 32;
+        for (t, piece) in occ_parts[p].iter().enumerate() {
+            for o in piece {
                 let (l, ins) = map.get_or_insert(o.h as u32 as u64, o.key, keys.len() as u32);
                 if ins {
                     keys.push(o.key);
                 }
-                locals.push(l);
+                let slot = (pair_base[t] + o.pair as usize) * 2 + o.side as usize;
+                unsafe { *endpoints.at(slot) = partition_bits | l as u64 };
             }
         }
-        *interned[p].lock().unwrap() = Some((map, keys, locals));
+        *interned[p].lock().unwrap() = Some((map, keys));
     });
-    let interned: Vec<(KeyMap<u32>, Vec<Key>, Vec<u32>)> =
-        interned.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
-    let mut base = Vec::with_capacity(PB + 1);
-    let mut nids = 0usize;
-    for (_, keys, _) in &interned {
-        base.push(nids);
-        nids += keys.len();
-    }
-
-    // C: global ID per pair side, global key array.
-    let mut pair_gid = vec![0u32; npairs * 2];
-    let mut gkeys = vec![Key::EMPTY; nids];
-    {
-        let pg = SyncPtr(pair_gid.as_mut_ptr());
-        let gk = SyncPtr(gkeys.as_mut_ptr());
-        let next = AtomicUsize::new(0);
-        let (occ_parts, interned, base, pair_base) = (&occ_parts, &interned, &base, &pair_base);
-        run_par(nt, move |_| loop {
-            let p = next.fetch_add(1, Relaxed);
-            if p >= PB {
-                break;
-            }
-            let (_, keys, locals) = &interned[p];
-            for (l, k) in keys.iter().enumerate() {
-                unsafe { *gk.at(base[p] + l) = *k };
-            }
-            let mut i = 0;
-            for (t, v) in occ_parts[p].iter().enumerate() {
-                for o in v {
-                    let gid = (base[p] + locals[i] as usize) as u32;
-                    i += 1;
-                    let slot = (pair_base[t] + o.pair as usize) * 2 + o.side as usize;
-                    unsafe { *pg.at(slot) = gid };
-                }
-            }
-        });
-    }
     drop(occ_parts);
 
-    // D: union-find; the root of each set is always its byte-wise smallest ID.
-    let mut parent: Vec<u32> = (0..nids as u32).collect();
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let gp = parent[parent[x as usize] as usize];
-            parent[x as usize] = gp;
-            x = gp;
-        }
-        x
+    // C: pack the keys into a global array for union-find.
+    let interned: Vec<_> = interned.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
+    let nids = interned.iter().map(|(_, keys)| keys.len()).sum();
+    let mut base = Vec::with_capacity(PB + 1);
+    let mut gkeys = Vec::with_capacity(nids);
+    let mut maps = Vec::with_capacity(PB);
+    for (map, keys) in interned {
+        base.push(gkeys.len());
+        gkeys.extend(keys);
+        maps.push(map);
     }
-    for pr in pair_gid.chunks_exact(2) {
-        let ra = find(&mut parent, pr[0]);
-        let rb = find(&mut parent, pr[1]);
-        if ra != rb {
-            if gkeys[ra as usize].get() < gkeys[rb as usize].get() {
-                parent[rb as usize] = ra;
-            } else {
-                parent[ra as usize] = rb;
-            }
-        }
-    }
-    for i in 0..nids as u32 {
-        let r = find(&mut parent, i);
-        parent[i as usize] = r;
-    }
-    drop(pair_gid);
 
-    // E: a root's original partition already matches its canonical key's
-    // hash. Store each root name once and route aliases using its index.
-    base.push(nids);
-    let mut root_person = vec![LinkedPerson::default(); nids];
-    let mut names: Vec<Vec<Key>> = (0..PB).map(|_| Vec::new()).collect();
-    for (p, names) in names.iter_mut().enumerate() {
-        for i in base[p]..base[p + 1] {
-            if parent[i] as usize == i {
-                root_person[i] = LinkedPerson { index: names.len() as u32, partition: p as u8 };
-                names.push(gkeys[i]);
+    LinkEndpoints { pair_ids, base, keys: gkeys, maps }
+}
+
+impl LinkEndpoints {
+    fn resolve(self) -> Links {
+        let Self { pair_ids, mut base, keys, maps } = self;
+        let nids = keys.len();
+        // Union-find; the root of each set is always its byte-wise smallest ID.
+        let mut parent: Vec<u32> = (0..nids as u32).collect();
+        fn find(parent: &mut [u32], mut x: u32) -> u32 {
+            while parent[x as usize] != x {
+                let gp = parent[parent[x as usize] as usize];
+                parent[x as usize] = gp;
+                x = gp;
+            }
+            x
+        }
+        let to_global = |id: u64| (base[(id >> 32) as usize] + id as u32 as usize) as u32;
+        for pr in pair_ids.chunks_exact(2) {
+            let ra = find(&mut parent, to_global(pr[0]));
+            let rb = find(&mut parent, to_global(pr[1]));
+            if ra != rb {
+                if keys[ra as usize].get() < keys[rb as usize].get() {
+                    parent[rb as usize] = ra;
+                } else {
+                    parent[ra as usize] = rb;
+                }
             }
         }
+        for i in 0..nids as u32 {
+            let r = find(&mut parent, i);
+            parent[i as usize] = r;
+        }
+        drop(pair_ids);
+
+        // A root's original partition already matches its canonical key's
+        // hash. Store each root name once and route aliases using its index.
+        base.push(nids);
+        let mut root_person = vec![LinkedPerson::default(); nids];
+        let mut names: Vec<Vec<Key>> = (0..PB).map(|_| Vec::new()).collect();
+        for (p, names) in names.iter_mut().enumerate() {
+            for i in base[p]..base[p + 1] {
+                if parent[i] as usize == i {
+                    root_person[i] = LinkedPerson { index: names.len() as u32, partition: p as u8 };
+                    names.push(keys[i]);
+                }
+            }
+        }
+        let aliases = maps
+            .into_iter()
+            .enumerate()
+            .map(|(p, map)| {
+                let persons = parent[base[p]..base[p + 1]].iter().map(|&r| root_person[r as usize]).collect();
+                LinkPart { map, persons }
+            })
+            .collect();
+        Links { aliases, names }
     }
-    let aliases = interned
-        .into_iter()
-        .enumerate()
-        .map(|(p, (map, _, _))| {
-            let persons = parent[base[p]..base[p + 1]].iter().map(|&r| root_person[r as usize]).collect();
-            LinkPart { map, persons }
-        })
-        .collect();
-    Links { aliases, names }
 }
 
 // ------------------------------------------------------------------ campaign accumulator
@@ -605,12 +606,12 @@ struct Sess {
 }
 
 #[derive(Default)]
-struct PersonRows {
-    events: Vec<SE>,
-    clicks: Vec<SC>,
+struct PersonRows<T> {
+    events: Vec<SE<T>>,
+    clicks: Vec<SC<T>>,
 }
 
-struct Worker<'a> {
+struct Worker<'a, T> {
     ctx: &'a Ctx,
     acc: Acc,
     // user_daily rows
@@ -623,7 +624,7 @@ struct Worker<'a> {
     // scratch
     names: Vec<Key>,
     linked_pid: Vec<u32>,
-    groups: Vec<PersonRows>,
+    groups: Vec<PersonRows<T>>,
     sess: Vec<Sess>,
     purchases: Vec<(u32, u32, u32)>, // (session idx, cat, price)
     catsum: Vec<i64>,
@@ -634,7 +635,7 @@ struct Worker<'a> {
     bycamp: Vec<(u32, i64)>,
 }
 
-impl<'a> Worker<'a> {
+impl<'a, T: Stamp> Worker<'a, T> {
     fn new(ctx: &'a Ctx) -> Self {
         Worker {
             ctx,
@@ -659,7 +660,7 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn partition<T: Stamp>(&mut self, linked_names: &[Key], evs: Vec<Vec<PE<T>>>, cls: Vec<Vec<PC<T>>>) {
+    fn partition(&mut self, linked_names: &[Key], evs: Vec<Vec<PE<T>>>, cls: Vec<Vec<PC<T>>>) {
         let n: usize = evs.iter().map(|v| v.len()).sum();
         if n == 0 {
             return;
@@ -697,7 +698,7 @@ impl<'a> Worker<'a> {
                     group.clicks.clear();
                 }
             }
-            groups[id as usize].events.push(SE { ts: e.ts.decode(self.ctx.cws), price: e.price & !LINKED, cat: e.cat });
+            groups[id as usize].events.push(SE { ts: e.ts, price: e.price & !LINKED, cat: e.cat });
         }
         if self.names.is_empty() {
             self.groups = groups;
@@ -713,7 +714,7 @@ impl<'a> Worker<'a> {
                 self.linked_pid[c.person as usize]
             };
             if p != NO_PERSON {
-                groups[p as usize].clicks.push(SC { ts: c.ts.decode(self.ctx.cws), id: c.id, camp: c.camp });
+                groups[p as usize].clicks.push(SC { ts: c.ts, id: c.id, camp: c.camp });
             }
         }
         for (p, group) in groups[..self.names.len()].iter_mut().enumerate() {
@@ -725,15 +726,16 @@ impl<'a> Worker<'a> {
         self.groups = groups;
     }
 
-    fn person(&mut self, name: Key, evs: &[SE], cls: &[SC]) {
+    fn person(&mut self, name: Key, evs: &[SE<T>], cls: &[SC<T>]) {
         let ctx = self.ctx;
         // Sessionize.
         self.sess.clear();
         self.purchases.clear();
         let mut last = i64::MIN;
         for e in evs {
-            if self.sess.is_empty() || e.ts - last > GAP {
-                self.sess.push(Sess { start: e.ts, day: e.ts.div_euclid(DAY), nev: 0, rev: 0, purch: false });
+            let ts = e.ts.decode(ctx.cws);
+            if self.sess.is_empty() || ts - last > GAP {
+                self.sess.push(Sess { start: ts, day: ts.div_euclid(DAY), nev: 0, rev: 0, purch: false });
             }
             let si = self.sess.len() - 1;
             let s = &mut self.sess[si];
@@ -743,7 +745,7 @@ impl<'a> Worker<'a> {
                 s.purch = true;
                 self.purchases.push((si as u32, e.cat, e.price));
             }
-            last = e.ts;
+            last = ts;
         }
 
         // user_daily: runs of sessions sharing a start day.
@@ -806,10 +808,10 @@ impl<'a> Worker<'a> {
         let mut j = 0;
         for i in 0..ns {
             let s = self.sess[i];
-            while j < cls.len() && cls[j].ts <= s.start {
+            while j < cls.len() && cls[j].ts.decode(ctx.cws) <= s.start {
                 j += 1;
             }
-            let camp = if j > 0 && cls[j - 1].ts >= s.start - WEEK { cls[j - 1].camp } else { ctx.organic };
+            let camp = if j > 0 && cls[j - 1].ts.decode(ctx.cws) >= s.start - WEEK { cls[j - 1].camp } else { ctx.organic };
             let v = self.acc.at(camp, s.day);
             v[0] += 1;
             v[1] += s.purch as i64;
@@ -821,7 +823,7 @@ impl<'a> Worker<'a> {
             return;
         }
         self.bycamp.clear();
-        self.bycamp.extend(cls.iter().map(|c| (c.camp, c.ts)));
+        self.bycamp.extend(cls.iter().map(|c| (c.camp, c.ts.decode(ctx.cws))));
         self.bycamp.sort_unstable();
         let mut i = 0;
         let nb = self.bycamp.len();
@@ -886,7 +888,7 @@ fn aggregate<T: Stamp>(
     target: usize,
     nt: usize,
     ctx: &Ctx,
-    links: &Links,
+    endpoints: LinkEndpoints,
     user_dir: &Path,
     stage: &mut impl FnMut(&str),
 ) -> Vec<Acc> {
@@ -896,7 +898,7 @@ fn aggregate<T: Stamp>(
     let ev_rows = est_rows(event_files);
     let cl_rows = est_rows(click_files);
     let next = AtomicUsize::new(0);
-    let ev_out: Vec<(Vec<Vec<D>>, Vec<Vec<PE<T>>>)> = run_par(nt, |tid| {
+    let parse_events = |tid: usize| {
         let mut db: Vec<Vec<D>> = new_bufs(ev_rows, nt);
         let mut ub: Vec<Vec<PE<T>>> = new_bufs(ev_rows, nt);
         loop {
@@ -955,6 +957,19 @@ fn aggregate<T: Stamp>(
             });
         }
         (db, ub)
+    };
+    // Raw event parsing does not consult aliases. The caller builds the link
+    // components while the other workers parse, then joins the event work.
+    let (links, ev_out) = std::thread::scope(|scope| {
+        let parse_events = &parse_events;
+        let workers: Vec<_> = (0..nt - 1).map(|tid| scope.spawn(move || parse_events(tid))).collect();
+        let start = Instant::now();
+        let links = endpoints.resolve();
+        eprintln!("links union {:>13} us (overlapped)", start.elapsed().as_micros());
+        let last = parse_events(nt - 1);
+        let mut events: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        events.push(last);
+        (links, events)
     });
     let (d_bufs, mut ue_bufs): (Vec<_>, Vec<_>) = ev_out.into_iter().unzip();
     stage("events");
@@ -1277,18 +1292,18 @@ fn main() {
     };
 
     // mmap all CSVs in parallel.
-    let mut paths: Vec<(u8, PathBuf)> = Vec::new();
+    let mut paths = Vec::new();
     for (k, dir) in [(0u8, "events"), (1, "clicks"), (2, "links")] {
-        for p in list_csv(&data.join(dir)) {
-            paths.push((k, p));
+        for (path, len) in list_csv(&data.join(dir)) {
+            paths.push((k, path, len));
         }
     }
-    paths.sort_by_key(|(_, p)| std::cmp::Reverse(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
+    paths.sort_by_key(|&(_, _, len)| std::cmp::Reverse(len));
     // Allocator policy. Reusing freed heap memory across stages avoids page faults (fresh zeroed
     // pages) but holds peak RSS near 3x the input size, so only do it when that fits comfortably;
     // otherwise mmap big buffers so freed memory goes straight back to the OS.
     {
-        let input: u64 = paths.iter().map(|(_, p)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+        let input: u64 = paths.iter().map(|&(_, _, len)| len).sum();
         let mem_gb: u64 = std::env::var("MEM_GB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(24);
         let phys = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) as u64 * libc::sysconf(libc::_SC_PAGESIZE) as u64 };
         let mem = (mem_gb << 30).min(if phys > 0 { phys } else { u64::MAX });
@@ -1325,7 +1340,7 @@ fn main() {
     stage("load");
 
     // ---- links
-    let links = build_links(&files[2], target, nt);
+    let endpoints = parse_links(&files[2], target, nt);
     stage("links");
 
     let user_dir = output.join("user_daily");
@@ -1334,9 +1349,9 @@ fn main() {
     // Clicks have the wider window. Only store offsets when every accepted
     // timestamp can fit, including the earliest qualifying click.
     let accs = if ctx.we.saturating_sub(ctx.cws) <= i64::from(u32::MAX) + 1 {
-        aggregate::<u32>(&files[0], &files[1], target, nt, &ctx, &links, &user_dir, &mut stage)
+        aggregate::<u32>(&files[0], &files[1], target, nt, &ctx, endpoints, &user_dir, &mut stage)
     } else {
-        aggregate::<i64>(&files[0], &files[1], target, nt, &ctx, &links, &user_dir, &mut stage)
+        aggregate::<i64>(&files[0], &files[1], target, nt, &ctx, endpoints, &user_dir, &mut stage)
     };
 
     // ---- campaign_daily
