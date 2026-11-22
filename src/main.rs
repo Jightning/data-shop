@@ -8,7 +8,7 @@
 //!   clicks   parallel chunked parse + validation, scattered by hash(user_id)
 //!   dedup    per event_id partition: keep the smallest ingest_ts copy, scatter by hash(user_id)
 //!   resolve  per user_id partition: map each ID to its person via that partition's link table,
-//!            scatter events and clicks by hash(person)
+//!            move only events and clicks that change partition
 //!   persons  per person partition (largest first): sessionize, credit, assists, user_daily shard
 //!   campaign merge per-worker campaign/day counters, write campaign_daily
 //! then `_exit(0)`.
@@ -42,38 +42,139 @@ fn part(h: u64) -> usize {
 
 // ------------------------------------------------------------------ records
 
-/// One event copy, for dedup only: its event_id, ingest_ts, and where its record lives in the
-/// user-bucket scatter (thread << 56 | bucket << 48 | index), or NONE if the copy is invalid.
-/// 40 bytes.
+/// One event copy for global dedup. The ID points into the read-only input.
 #[derive(Clone, Copy)]
 struct D {
     idh: u64,
-    id: Key,
-    ingest: i64,
+    id: *const u8,
+    ingest_and_len: u64,
     loc: u64,
+}
+
+// Every D points into a leaked mapping or a leaked read buffer. Workers only read the ID bytes.
+unsafe impl Send for D {}
+
+impl D {
+    const INGEST_BITS: u32 = 40;
+    const INGEST_MASK: u64 = (1 << Self::INGEST_BITS) - 1;
+    const LONG_ID: u64 = u64::MAX >> Self::INGEST_BITS;
+
+    /// The ID must come from the first field of a well-formed event row. Its
+    /// unquoted bytes are followed by either a closing quote or a comma.
+    #[inline(always)]
+    unsafe fn new(idh: u64, id: Bs, ingest: i64, loc: u64) -> Self {
+        // The valid F1 years 0000..=9999 fit in signed 40-bit epoch
+        // seconds. Bias them to preserve chronological order as unsigned.
+        let ordered_ingest = if ingest == i64::MAX {
+            Self::INGEST_MASK
+        } else {
+            (ingest / 1000 + (1 << (Self::INGEST_BITS - 1))) as u64
+        };
+        let len = (id.n as u64).min(Self::LONG_ID);
+        Self { idh, id: id.p, ingest_and_len: (len << Self::INGEST_BITS) | ordered_ingest, loc }
+    }
+
+    #[inline(always)]
+    fn ingest_order(&self) -> u64 {
+        self.ingest_and_len & Self::INGEST_MASK
+    }
+
+    #[inline]
+    fn same_id(&self, other: &Self) -> bool {
+        let len = self.ingest_and_len >> Self::INGEST_BITS;
+        if len != other.ingest_and_len >> Self::INGEST_BITS {
+            return false;
+        }
+        if len < Self::LONG_ID {
+            // Both parsed fields supplied the same byte length.
+            return unsafe {
+                std::slice::from_raw_parts(self.id, len as usize)
+                    == std::slice::from_raw_parts(other.id, len as usize)
+            };
+        }
+        self.same_long_id(other)
+    }
+
+    #[cold]
+    fn same_long_id(&self, other: &Self) -> bool {
+        let mut a = self.id;
+        let mut b = other.id;
+        loop {
+            // Each walk stops at its first delimiter. Quoting syntax was
+            // validated by the CSV scanner, and neither byte can be in a value.
+            let (x, y) = unsafe { (*a, *b) };
+            let end_x = matches!(x, b',' | b'"');
+            let end_y = matches!(y, b',' | b'"');
+            if end_x || end_y {
+                return end_x && end_y;
+            }
+            if x != y {
+                return false;
+            }
+            unsafe {
+                a = a.add(1);
+                b = b.add(1);
+            }
+        }
+    }
 }
 const NONE: u64 = u64::MAX;
 /// Reserved price for a valid copy that lost to an earlier ingest.
 const DEAD: u32 = u32::MAX;
+/// A resolved event whose hash field now holds a canonical name index.
+const LINKED: u32 = 1 << 31;
+const NO_PERSON: u32 = u32::MAX;
+/// The highest campaign index is reserved for organic and cannot appear in a click.
+const MOVED_CLICK: u32 = u32::MAX;
 
-/// A surviving event keyed by user ID (after dedup) or by person (after resolve). 40 bytes.
+trait Stamp: Copy + Send {
+    fn encode(ts: i64, origin: i64) -> Self;
+    fn decode(self, origin: i64) -> i64;
+}
+
+impl Stamp for u32 {
+    #[inline(always)]
+    fn encode(ts: i64, origin: i64) -> Self {
+        (ts - origin) as u32
+    }
+
+    #[inline(always)]
+    fn decode(self, origin: i64) -> i64 {
+        origin + self as i64
+    }
+}
+
+impl Stamp for i64 {
+    #[inline(always)]
+    fn encode(ts: i64, _: i64) -> Self {
+        ts
+    }
+
+    #[inline(always)]
+    fn decode(self, _: i64) -> i64 {
+        self
+    }
+}
+
+/// A surviving event keyed by raw user or canonical person. 32 or 40 bytes.
 #[derive(Clone, Copy)]
-struct PE {
-    h: u64,
+struct PE<T> {
+    h: u32,
     key: Key,
-    ts: i64,
+    ts: T,
     price: u32,
     cat: u32,
 }
 
-/// A valid click keyed by user ID (after parse) or by person (after resolve). 56 bytes.
+/// A valid click keyed by raw user or canonical person. 48 or 56 bytes.
 #[derive(Clone, Copy)]
-struct PC {
-    h: u64,
+struct PC<T> {
+    h: u32,
     key: Key,
-    ts: i64,
+    ts: T,
     id: Key,
     camp: u32,
+    person: u32,
 }
 
 /// Per-person compact event for sorting.
@@ -110,24 +211,23 @@ struct Ctx {
     ndays: usize,
 }
 
+/// A canonical name's stable index within its hash partition.
+#[derive(Clone, Copy, Default)]
+struct LinkedPerson {
+    index: u32,
+    partition: u8,
+}
+
 /// Link lookup for the IDs whose hash falls in one partition.
 struct LinkPart {
     map: KeyMap<u32>,
-    name: Vec<Key>,
-    nh: Vec<u64>,
+    persons: Vec<LinkedPerson>,
 }
 
-impl LinkPart {
-    #[inline(always)]
-    fn resolve(&self, h: u64, k: Key) -> (u64, Key) {
-        match self.map.get(h, &k) {
-            Some(i) => (self.nh[i as usize], self.name[i as usize]),
-            None => (h, k),
-        }
-    }
+struct Links {
+    aliases: Vec<LinkPart>,
+    names: Vec<Vec<Key>>,
 }
-
-// ------------------------------------------------------------------ helpers
 
 fn run_par<R: Send>(nt: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     std::thread::scope(|s| {
@@ -264,7 +364,7 @@ fn new_bufs<T>(rows: usize, nt: usize) -> Vec<Vec<T>> {
 
 // ------------------------------------------------------------------ links
 
-fn build_links(files: &[&'static [u8]], target: usize, nt: usize) -> Vec<LinkPart> {
+fn build_links(files: &[&'static [u8]], target: usize, nt: usize) -> Links {
     // A: parse; scatter each ID occurrence by hash partition.
     #[derive(Clone, Copy)]
     struct Occ {
@@ -307,9 +407,11 @@ fn build_links(files: &[&'static [u8]], target: usize, nt: usize) -> Vec<LinkPar
             debug_assert_eq!(occ_parts[p].len(), t + 1);
         }
     }
-    let empty = || (0..PB).map(|_| LinkPart { map: KeyMap::with_capacity(0), name: Vec::new(), nh: Vec::new() }).collect();
     if npairs == 0 {
-        return empty();
+        return Links {
+            aliases: (0..PB).map(|_| LinkPart { map: KeyMap::with_capacity(0), persons: Vec::new() }).collect(),
+            names: (0..PB).map(|_| Vec::new()).collect(),
+        };
     }
 
     // B: per partition, intern distinct IDs (local index per occurrence).
@@ -326,7 +428,7 @@ fn build_links(files: &[&'static [u8]], target: usize, nt: usize) -> Vec<LinkPar
         let mut locals = Vec::with_capacity(n);
         for v in &occ_parts[p] {
             for o in v {
-                let (l, ins) = map.get_or_insert(o.h, o.key, keys.len() as u32);
+                let (l, ins) = map.get_or_insert(o.h as u32 as u64, o.key, keys.len() as u32);
                 if ins {
                     keys.push(o.key);
                 }
@@ -401,36 +503,28 @@ fn build_links(files: &[&'static [u8]], target: usize, nt: usize) -> Vec<LinkPar
     }
     drop(pair_gid);
 
-    // E: per partition, each ID's person name and its hash.
-    let root_hash: Vec<u64> = {
-        // Hash only roots (in parallel, by index range).
-        let mut rh = vec![0u64; nids];
-        let ptr = SyncPtr(rh.as_mut_ptr());
-        let per = nids.div_ceil(nt);
-        let (parent, gkeys) = (&parent, &gkeys);
-        run_par(nt, move |t| {
-            for i in t * per..((t + 1) * per).min(nids) {
-                if parent[i] as usize == i {
-                    unsafe { *ptr.at(i) = hash(gkeys[i].get()) };
-                }
+    // E: a root's original partition already matches its canonical key's
+    // hash. Store each root name once and route aliases using its index.
+    base.push(nids);
+    let mut root_person = vec![LinkedPerson::default(); nids];
+    let mut names: Vec<Vec<Key>> = (0..PB).map(|_| Vec::new()).collect();
+    for (p, names) in names.iter_mut().enumerate() {
+        for i in base[p]..base[p + 1] {
+            if parent[i] as usize == i {
+                root_person[i] = LinkedPerson { index: names.len() as u32, partition: p as u8 };
+                names.push(gkeys[i]);
             }
-        });
-        rh
-    };
-    interned
+        }
+    }
+    let aliases = interned
         .into_iter()
         .enumerate()
-        .map(|(p, (map, keys, _))| {
-            let mut name = Vec::with_capacity(keys.len());
-            let mut nh = Vec::with_capacity(keys.len());
-            for l in 0..keys.len() {
-                let r = parent[base[p] + l] as usize;
-                name.push(gkeys[r]);
-                nh.push(root_hash[r]);
-            }
-            LinkPart { map, name, nh }
+        .map(|(p, (map, _, _))| {
+            let persons = parent[base[p]..base[p + 1]].iter().map(|&r| root_person[r as usize]).collect();
+            LinkPart { map, persons }
         })
-        .collect()
+        .collect();
+    Links { aliases, names }
 }
 
 // ------------------------------------------------------------------ campaign accumulator
@@ -510,6 +604,12 @@ struct Sess {
     purch: bool,
 }
 
+#[derive(Default)]
+struct PersonRows {
+    events: Vec<SE>,
+    clicks: Vec<SC>,
+}
+
 struct Worker<'a> {
     ctx: &'a Ctx,
     acc: Acc,
@@ -521,14 +621,9 @@ struct Worker<'a> {
     u_rev: Vec<i64>,
     u_top: Vec<u32>,
     // scratch
-    pid: Vec<u32>,
     names: Vec<Key>,
-    off: Vec<u32>,
-    cur: Vec<u32>,
-    se: Vec<SE>,
-    coff: Vec<u32>,
-    cpid: Vec<u32>,
-    sc: Vec<SC>,
+    linked_pid: Vec<u32>,
+    groups: Vec<PersonRows>,
     sess: Vec<Sess>,
     purchases: Vec<(u32, u32, u32)>, // (session idx, cat, price)
     catsum: Vec<i64>,
@@ -550,14 +645,9 @@ impl<'a> Worker<'a> {
             u_ev: Vec::new(),
             u_rev: Vec::new(),
             u_top: Vec::new(),
-            pid: Vec::new(),
             names: Vec::new(),
-            off: Vec::new(),
-            cur: Vec::new(),
-            se: Vec::new(),
-            coff: Vec::new(),
-            cpid: Vec::new(),
-            sc: Vec::new(),
+            linked_pid: Vec::new(),
+            groups: Vec::new(),
             sess: Vec::new(),
             purchases: Vec::new(),
             catsum: vec![0; ctx.cat_names.len()],
@@ -569,97 +659,70 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn partition(&mut self, evs: Vec<Vec<PE>>, cls: Vec<Vec<PC>>) {
+    fn partition<T: Stamp>(&mut self, linked_names: &[Key], evs: Vec<Vec<PE<T>>>, cls: Vec<Vec<PC<T>>>) {
         let n: usize = evs.iter().map(|v| v.len()).sum();
         if n == 0 {
             return;
         }
-        // Group events by person (exact name bytes).
-        let mut pmap: KeyMap<u32> = KeyMap::with_capacity(n / 4 + 16);
-        self.pid.clear();
+        let mut pmap: KeyMap<u32> = KeyMap::with_capacity(n / 16 + 16);
         self.names.clear();
-        for piece in &evs {
-            for e in piece {
-                let (id, ins) = pmap.get_or_insert(e.h, e.key, self.names.len() as u32);
-                if ins {
-                    self.names.push(e.key);
+        self.linked_pid.clear();
+        self.linked_pid.resize(linked_names.len(), NO_PERSON);
+        let mut groups = std::mem::take(&mut self.groups);
+        for e in evs.into_iter().flatten() {
+            if e.price == DEAD {
+                continue;
+            }
+            let next = self.names.len() as u32;
+            let (id, name) = if e.price & LINKED != 0 {
+                let index = e.h as usize;
+                let pid = &mut self.linked_pid[index];
+                if *pid == NO_PERSON {
+                    *pid = next;
+                    (next, Some(linked_names[index]))
+                } else {
+                    (*pid, None)
                 }
-                self.pid.push(id);
-            }
-        }
-        let np = self.names.len();
-        self.off.clear();
-        self.off.resize(np + 1, 0);
-        for &p in &self.pid {
-            self.off[p as usize + 1] += 1;
-        }
-        for i in 0..np {
-            self.off[i + 1] += self.off[i];
-        }
-        self.cur.clear();
-        self.cur.extend_from_slice(&self.off[..np]);
-        self.se.clear();
-        self.se.resize(n, SE::default());
-        let mut k = 0;
-        for piece in &evs {
-            for e in piece {
-                let p = self.pid[k] as usize;
-                k += 1;
-                let at = self.cur[p] as usize;
-                self.cur[p] += 1;
-                self.se[at] = SE { ts: e.ts, price: e.price, cat: e.cat };
-            }
-        }
-        drop(evs);
-
-        // Clicks of people with events.
-        self.cpid.clear();
-        let mut ccount = vec![0u32; np + 1];
-        for piece in &cls {
-            for c in piece {
-                let p = pmap.get(c.h, &c.key).unwrap_or(u32::MAX);
-                if p != u32::MAX {
-                    ccount[p as usize + 1] += 1;
+            } else {
+                let (id, inserted) = pmap.get_or_insert(e.h as u64, e.key, next);
+                (id, inserted.then_some(e.key))
+            };
+            if let Some(name) = name {
+                self.names.push(name);
+                if id as usize == groups.len() {
+                    groups.push(PersonRows::default());
+                } else {
+                    let group = &mut groups[id as usize];
+                    group.events.clear();
+                    group.clicks.clear();
                 }
-                self.cpid.push(p);
+            }
+            groups[id as usize].events.push(SE { ts: e.ts.decode(self.ctx.cws), price: e.price & !LINKED, cat: e.cat });
+        }
+        if self.names.is_empty() {
+            self.groups = groups;
+            return;
+        }
+        for c in cls.into_iter().flatten() {
+            if c.camp == MOVED_CLICK {
+                continue;
+            }
+            let p = if c.person == NO_PERSON {
+                pmap.get(c.h as u64, &c.key).unwrap_or(NO_PERSON)
+            } else {
+                self.linked_pid[c.person as usize]
+            };
+            if p != NO_PERSON {
+                groups[p as usize].clicks.push(SC { ts: c.ts.decode(self.ctx.cws), id: c.id, camp: c.camp });
             }
         }
-        for i in 0..np {
-            ccount[i + 1] += ccount[i];
+        for (p, group) in groups[..self.names.len()].iter_mut().enumerate() {
+            group.events.sort_unstable_by_key(|e| e.ts);
+            // For equal times, the final click in the range has the smallest ID.
+            group.clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.get().cmp(a.id.get())));
+            self.person(self.names[p], &group.events, &group.clicks);
         }
-        self.coff.clear();
-        self.coff.extend_from_slice(&ccount);
-        let ctotal = ccount[np] as usize;
-        self.sc.clear();
-        self.sc.resize(ctotal, SC { ts: 0, id: Key::EMPTY, camp: 0 });
-        let mut k = 0;
-        for piece in &cls {
-            for c in piece {
-                let p = self.cpid[k];
-                k += 1;
-                if p == u32::MAX {
-                    continue;
-                }
-                let at = ccount[p as usize] as usize;
-                ccount[p as usize] += 1;
-                self.sc[at] = SC { ts: c.ts, id: c.id, camp: c.camp };
-            }
-        }
-        drop(cls);
-
-        let mut se = std::mem::take(&mut self.se);
-        let mut sc = std::mem::take(&mut self.sc);
-        for p in 0..np {
-            let evs = &mut se[self.off[p] as usize..self.off[p + 1] as usize];
-            evs.sort_unstable_by_key(|e| e.ts);
-            let cls = &mut sc[self.coff[p] as usize..self.coff[p + 1] as usize];
-            // ts ascending; within equal ts, click_id descending so the last one <= start
-            // is the latest click with the smallest id.
-            cls.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.get().cmp(a.id.get())));
-            self.person(self.names[p], evs, cls);
-        }
-        self.se = se;
-        self.sc = sc;
+        self.groups = groups;
     }
 
     fn person(&mut self, name: Key, evs: &[SE], cls: &[SC]) {
@@ -817,6 +880,302 @@ impl<'a> Worker<'a> {
     }
 }
 
+fn aggregate<T: Stamp>(
+    event_files: &[&'static [u8]],
+    click_files: &[&'static [u8]],
+    target: usize,
+    nt: usize,
+    ctx: &Ctx,
+    links: &Links,
+    user_dir: &Path,
+    stage: &mut impl FnMut(&str),
+) -> Vec<Acc> {
+    // ---- events: parse + validate each copy. Valid copies go straight to their user bucket;
+    // every copy also leaves a small dedup record, scattered by hash(event_id).
+    let ev_chunks = make_chunks(event_files, target);
+    let ev_rows = est_rows(event_files);
+    let cl_rows = est_rows(click_files);
+    let next = AtomicUsize::new(0);
+    let ev_out: Vec<(Vec<Vec<D>>, Vec<Vec<PE<T>>>)> = run_par(nt, |tid| {
+        let mut db: Vec<Vec<D>> = new_bufs(ev_rows, nt);
+        let mut ub: Vec<Vec<PE<T>>> = new_bufs(ev_rows, nt);
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= ev_chunks.len() {
+                break;
+            }
+            csvp::for_records::<7>(ev_chunks[i], |f| {
+                if f[0].is_empty() {
+                    return;
+                }
+                let ingest = ts::parse_ingest(f[3].get()).unwrap_or(i64::MAX);
+                let mut valid = !f[1].is_empty() && !f[5].is_empty();
+                let mut t = 0i64;
+                let mut purchase = false;
+                let mut price = 0u32;
+                let mut cat = 0u32;
+                if valid {
+                    match ts::parse_ts(f[2].get()) {
+                        Some(x) if x >= ctx.ws && x < ctx.we => t = x,
+                        _ => valid = false,
+                    }
+                }
+                if valid {
+                    match f[4].get() {
+                        b"view" | b"cart" => {}
+                        b"purchase" => purchase = true,
+                        _ => valid = false,
+                    }
+                }
+                if valid && purchase {
+                    match ts::parse_price(f[6].get()) {
+                        Some(p) => {
+                            price = p;
+                            cat = ctx.products.get(hash(f[5].get()), f[5].get()).unwrap_or(ctx.unknown);
+                        }
+                        None => valid = false,
+                    }
+                }
+                if valid && ingest.saturating_sub(t) > DAY {
+                    valid = false;
+                }
+                let loc = if valid {
+                    let uh = hash(f[1].get());
+                    let u = part(uh);
+                    let idx = ub[u].len() as u64;
+                    ub[u].push(PE { h: uh as u32, key: Key::from_bs(f[1]), ts: T::encode(t, ctx.cws), price, cat });
+                    ((tid as u64) << 56) | ((u as u64) << 48) | idx
+                } else {
+                    NONE
+                };
+                let idh = hash(f[0].get());
+                // The accepted first field is followed by a known delimiter and
+                // stays mapped through dedup.
+                db[part(idh)].push(unsafe { D::new(idh, f[0], ingest, loc) });
+            });
+        }
+        (db, ub)
+    });
+    let (d_bufs, mut ue_bufs): (Vec<_>, Vec<_>) = ev_out.into_iter().unzip();
+    stage("events");
+
+    // ---- clicks: parse + validate, scatter by hash(user_id)
+    let cl_chunks = make_chunks(click_files, target);
+    let next = AtomicUsize::new(0);
+    let cl_bufs: Vec<Vec<Vec<PC<T>>>> = run_par(nt, |_| {
+        let mut bufs: Vec<Vec<PC<T>>> = new_bufs(cl_rows, nt);
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= cl_chunks.len() {
+                break;
+            }
+            csvp::for_records::<4>(cl_chunks[i], |f| {
+                if f[0].is_empty() || f[1].is_empty() {
+                    return;
+                }
+                let t = match ts::parse_ts(f[3].get()) {
+                    Some(x) if x >= ctx.cws && x < ctx.we => x,
+                    _ => return,
+                };
+                let camp = match ctx.campaigns.get(hash(f[2].get()), f[2].get()) {
+                    Some(c) => c,
+                    None => return,
+                };
+                let uh = hash(f[1].get());
+                bufs[part(uh)].push(PC { h: uh as u32, key: Key::from_bs(f[1]), ts: T::encode(t, ctx.cws), id: Key::from_bs(f[0]), camp, person: NO_PERSON });
+            });
+        }
+        bufs
+    });
+    stage("clicks");
+
+    // ---- dedup per event_id partition: for each event_id keep the copy with the smallest
+    // ingest_ts; every valid copy that loses is marked DEAD in place in its user bucket.
+    let ue_ptr: Vec<Vec<SyncPtr<PE<T>>>> =
+        ue_bufs.iter_mut().map(|bufs| bufs.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect()).collect();
+    let d_parts = transpose(d_bufs);
+    let next = AtomicUsize::new(0);
+    run_par(nt, |_| {
+        // Each bucket is split 16 ways by more hash bits into `scratch` so that every
+        // sub-bucket's records and its u32 index table stay L2-resident.
+        const SB: usize = 16;
+        let mut scratch: Vec<D> = Vec::new();
+        let mut table: Vec<u32> = Vec::new();
+        let ue_ptr = &ue_ptr;
+        let kill = |d: &D| {
+            if d.loc != NONE {
+                let t = (d.loc >> 56) as usize;
+                let u = ((d.loc >> 48) & 0xff) as usize;
+                let i = (d.loc & ((1 << 48) - 1)) as usize;
+                // Disjoint: each record belongs to one event_id, handled by one thread.
+                unsafe { (*ue_ptr[t][u].at(i)).price = DEAD };
+            }
+        };
+        loop {
+            let b = next.fetch_add(1, Relaxed);
+            if b >= PB {
+                break;
+            }
+            let pieces = std::mem::take(&mut *d_parts[b].lock().unwrap());
+            let n: usize = pieces.iter().map(|v| v.len()).sum();
+            if n == 0 {
+                continue;
+            }
+            let sub = |e: &D| ((e.idh >> 52) & (SB as u64 - 1)) as usize;
+            let mut start = [0usize; SB + 1];
+            for piece in &pieces {
+                for e in piece.iter() {
+                    start[sub(e) + 1] += 1;
+                }
+            }
+            for i in 0..SB {
+                start[i + 1] += start[i];
+            }
+            let mut pos = start;
+            scratch.clear();
+            scratch.reserve(n);
+            let dst = scratch.as_mut_ptr();
+            for piece in &pieces {
+                for e in piece.iter() {
+                    let k = sub(e);
+                    unsafe { dst.add(pos[k]).write(*e) };
+                    pos[k] += 1;
+                }
+            }
+            unsafe { scratch.set_len(n) };
+            drop(pieces);
+            for k in 0..SB {
+                let sl = &scratch[start[k]..start[k + 1]];
+                if sl.is_empty() {
+                    continue;
+                }
+                let cap = (sl.len() * 2).next_power_of_two();
+                let mask = cap - 1;
+                table.clear();
+                table.resize(cap, u32::MAX);
+                for (i, e) in sl.iter().enumerate() {
+                    let mut s = (e.idh as usize) & mask;
+                    loop {
+                        let c = table[s];
+                        if c == u32::MAX {
+                            table[s] = i as u32;
+                            break;
+                        }
+                        let o = &sl[c as usize];
+                        if o.idh == e.idh && o.same_id(e) {
+                            // A copy that loses never wins later (the kept ingest_ts only falls), so
+                            // it is marked now. Equal ingest_ts: copies are identical; keep the first.
+                            if e.ingest_order() < o.ingest_order() {
+                                kill(o);
+                                table[s] = i as u32;
+                            } else {
+                                kill(e);
+                            }
+                            break;
+                        }
+                        s = (s + 1) & mask;
+                    }
+                }
+            }
+        }
+    });
+    drop(d_parts);
+    stage("dedup");
+
+    // ---- resolve locally first. Only cross-partition aliases need a second scatter.
+    let pev_parts = transpose(ue_bufs);
+    let cl_parts = transpose(cl_bufs);
+    let next = AtomicUsize::new(0);
+    let moved: Vec<(Vec<Vec<PE<T>>>, Vec<Vec<PC<T>>>)> = run_par(nt, |_| {
+        let mut oe: Vec<Vec<PE<T>>> = (0..PB).map(|_| Vec::new()).collect();
+        let mut oc: Vec<Vec<PC<T>>> = (0..PB).map(|_| Vec::new()).collect();
+        loop {
+            let u = next.fetch_add(1, Relaxed);
+            if u >= PB {
+                break;
+            }
+            let lp = &links.aliases[u];
+            if lp.map.len == 0 {
+                continue;
+            }
+            for piece in &mut *pev_parts[u].lock().unwrap() {
+                for e in piece {
+                    if e.price == DEAD {
+                        continue;
+                    }
+                    if let Some(i) = lp.map.get(e.h as u64, &e.key) {
+                        let person = lp.persons[i as usize];
+                        e.h = person.index;
+                        e.price |= LINKED;
+                        let dest = person.partition as usize;
+                        if dest != u {
+                            oe[dest].push(*e);
+                            e.price = DEAD;
+                        }
+                    }
+                }
+            }
+            for piece in &mut *cl_parts[u].lock().unwrap() {
+                for c in piece {
+                    if let Some(i) = lp.map.get(c.h as u64, &c.key) {
+                        let person = lp.persons[i as usize];
+                        c.person = person.index;
+                        let dest = person.partition as usize;
+                        if dest != u {
+                            oc[dest].push(*c);
+                            c.camp = MOVED_CLICK;
+                        }
+                    }
+                }
+            }
+        }
+        (oe, oc)
+    });
+    for (oe, oc) in moved {
+        for (part, buf) in pev_parts.iter().zip(oe) {
+            if !buf.is_empty() {
+                part.lock().unwrap().push(buf);
+            }
+        }
+        for (part, buf) in cl_parts.iter().zip(oc) {
+            if !buf.is_empty() {
+                part.lock().unwrap().push(buf);
+            }
+        }
+    }
+    stage("resolve");
+
+    // ---- persons
+    let mut order: Vec<(usize, usize)> = pev_parts
+        .iter()
+        .enumerate()
+        .map(|(q, m)| (q, m.lock().unwrap().iter().map(|v| v.len()).sum()))
+        .collect();
+    order.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    std::fs::create_dir_all(user_dir).expect("create user_daily");
+    let next = AtomicUsize::new(0);
+    let accs: Vec<Acc> = run_par(nt, |tid| {
+        let mut w = Worker::new(ctx);
+        loop {
+            let k = next.fetch_add(1, Relaxed);
+            if k >= PB {
+                break;
+            }
+            let q = order[k].0;
+            let evs = std::mem::take(&mut *pev_parts[q].lock().unwrap());
+            let cls = std::mem::take(&mut *cl_parts[q].lock().unwrap());
+            w.partition(&links.names[q], evs, cls);
+        }
+        if !w.u_name.is_empty() || tid == 0 {
+            w.write_users(&user_dir.join(format!("part-{tid:03}.parquet"))).expect("write user_daily");
+        }
+        w.acc
+    });
+    stage("persons");
+
+    accs
+}
+
 // ------------------------------------------------------------------ main
 
 fn main() {
@@ -963,272 +1322,22 @@ fn main() {
     }
     let total_bytes: usize = files.iter().flatten().map(|f| f.len()).sum();
     let target = (total_bytes / (nt * 16)).clamp(1 << 16, 8 << 20);
-    let ev_rows = est_rows(&files[0]);
-    let cl_rows = est_rows(&files[1]);
     stage("load");
 
     // ---- links
     let links = build_links(&files[2], target, nt);
     stage("links");
 
-    // ---- events: parse + validate each copy. Valid copies go straight to their user bucket;
-    // every copy also leaves a small dedup record, scattered by hash(event_id).
-    let ev_chunks = make_chunks(&files[0], target);
-    let next = AtomicUsize::new(0);
-    let ev_out: Vec<(Vec<Vec<D>>, Vec<Vec<PE>>)> = run_par(nt, |tid| {
-        let mut db: Vec<Vec<D>> = new_bufs(ev_rows, nt);
-        let mut ub: Vec<Vec<PE>> = new_bufs(ev_rows, nt);
-        let ctx = &ctx;
-        loop {
-            let i = next.fetch_add(1, Relaxed);
-            if i >= ev_chunks.len() {
-                break;
-            }
-            csvp::for_records::<7>(ev_chunks[i], |f| {
-                if f[0].is_empty() {
-                    return;
-                }
-                let ingest = ts::parse_ingest(f[3].get()).unwrap_or(i64::MAX);
-                let mut valid = !f[1].is_empty() && !f[5].is_empty();
-                let mut t = 0i64;
-                let mut purchase = false;
-                let mut price = 0u32;
-                let mut cat = 0u32;
-                if valid {
-                    match ts::parse_ts(f[2].get()) {
-                        Some(x) if x >= ctx.ws && x < ctx.we => t = x,
-                        _ => valid = false,
-                    }
-                }
-                if valid {
-                    match f[4].get() {
-                        b"view" | b"cart" => {}
-                        b"purchase" => purchase = true,
-                        _ => valid = false,
-                    }
-                }
-                if valid && purchase {
-                    match ts::parse_price(f[6].get()) {
-                        Some(p) => {
-                            price = p;
-                            cat = ctx.products.get(hash(f[5].get()), f[5].get()).unwrap_or(ctx.unknown);
-                        }
-                        None => valid = false,
-                    }
-                }
-                if valid && ingest.saturating_sub(t) > DAY {
-                    valid = false;
-                }
-                let loc = if valid {
-                    let uh = hash(f[1].get());
-                    let u = part(uh);
-                    let idx = ub[u].len() as u64;
-                    ub[u].push(PE { h: uh, key: Key::from_bs(f[1]), ts: t, price, cat });
-                    ((tid as u64) << 56) | ((u as u64) << 48) | idx
-                } else {
-                    NONE
-                };
-                let idh = hash(f[0].get());
-                db[part(idh)].push(D { idh, id: Key::from_bs(f[0]), ingest, loc });
-            });
-        }
-        (db, ub)
-    });
-    let (d_bufs, mut ue_bufs): (Vec<_>, Vec<_>) = ev_out.into_iter().unzip();
-    stage("events");
-
-    // ---- clicks: parse + validate, scatter by hash(user_id)
-    let cl_chunks = make_chunks(&files[1], target);
-    let next = AtomicUsize::new(0);
-    let cl_bufs: Vec<Vec<Vec<PC>>> = run_par(nt, |_| {
-        let mut bufs: Vec<Vec<PC>> = new_bufs(cl_rows, nt);
-        let ctx = &ctx;
-        loop {
-            let i = next.fetch_add(1, Relaxed);
-            if i >= cl_chunks.len() {
-                break;
-            }
-            csvp::for_records::<4>(cl_chunks[i], |f| {
-                if f[0].is_empty() || f[1].is_empty() {
-                    return;
-                }
-                let t = match ts::parse_ts(f[3].get()) {
-                    Some(x) if x >= ctx.cws && x < ctx.we => x,
-                    _ => return,
-                };
-                let camp = match ctx.campaigns.get(hash(f[2].get()), f[2].get()) {
-                    Some(c) => c,
-                    None => return,
-                };
-                let uh = hash(f[1].get());
-                bufs[part(uh)].push(PC { h: uh, key: Key::from_bs(f[1]), ts: t, id: Key::from_bs(f[0]), camp });
-            });
-        }
-        bufs
-    });
-    stage("clicks");
-
-    // ---- dedup per event_id partition: for each event_id keep the copy with the smallest
-    // ingest_ts; every valid copy that loses is marked DEAD in place in its user bucket.
-    let ue_ptr: Vec<Vec<SyncPtr<PE>>> =
-        ue_bufs.iter_mut().map(|bufs| bufs.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect()).collect();
-    let d_parts = transpose(d_bufs);
-    let next = AtomicUsize::new(0);
-    run_par(nt, |_| {
-        // Each bucket is split 16 ways by more hash bits into `scratch` so that every
-        // sub-bucket's records and its u32 index table stay L2-resident.
-        const SB: usize = 16;
-        let mut scratch: Vec<D> = Vec::new();
-        let mut table: Vec<u32> = Vec::new();
-        let ue_ptr = &ue_ptr;
-        let kill = |d: &D| {
-            if d.loc != NONE {
-                let t = (d.loc >> 56) as usize;
-                let u = ((d.loc >> 48) & 0xff) as usize;
-                let i = (d.loc & ((1 << 48) - 1)) as usize;
-                // Disjoint: each record belongs to one event_id, handled by one thread.
-                unsafe { (*ue_ptr[t][u].at(i)).price = DEAD };
-            }
-        };
-        loop {
-            let b = next.fetch_add(1, Relaxed);
-            if b >= PB {
-                break;
-            }
-            let pieces = std::mem::take(&mut *d_parts[b].lock().unwrap());
-            let n: usize = pieces.iter().map(|v| v.len()).sum();
-            if n == 0 {
-                continue;
-            }
-            let sub = |e: &D| ((e.idh >> 52) & (SB as u64 - 1)) as usize;
-            let mut start = [0usize; SB + 1];
-            for piece in &pieces {
-                for e in piece.iter() {
-                    start[sub(e) + 1] += 1;
-                }
-            }
-            for i in 0..SB {
-                start[i + 1] += start[i];
-            }
-            let mut pos = start;
-            scratch.clear();
-            scratch.reserve(n);
-            let dst = scratch.as_mut_ptr();
-            for piece in &pieces {
-                for e in piece.iter() {
-                    let k = sub(e);
-                    unsafe { dst.add(pos[k]).write(*e) };
-                    pos[k] += 1;
-                }
-            }
-            unsafe { scratch.set_len(n) };
-            drop(pieces);
-            for k in 0..SB {
-                let sl = &scratch[start[k]..start[k + 1]];
-                if sl.is_empty() {
-                    continue;
-                }
-                let cap = (sl.len() * 2).next_power_of_two();
-                let mask = cap - 1;
-                table.clear();
-                table.resize(cap, u32::MAX);
-                for (i, e) in sl.iter().enumerate() {
-                    let mut s = (e.idh as usize) & mask;
-                    loop {
-                        let c = table[s];
-                        if c == u32::MAX {
-                            table[s] = i as u32;
-                            break;
-                        }
-                        let o = &sl[c as usize];
-                        if o.idh == e.idh && o.id.same(&e.id) {
-                            // A copy that loses never wins later (the kept ingest_ts only falls), so
-                            // it is marked now. Equal ingest_ts: copies are identical; keep the first.
-                            if e.ingest < o.ingest {
-                                kill(o);
-                                table[s] = i as u32;
-                            } else {
-                                kill(e);
-                            }
-                            break;
-                        }
-                        s = (s + 1) & mask;
-                    }
-                }
-            }
-        }
-    });
-    drop(d_parts);
-    stage("dedup");
-
-    // ---- resolve: user ID -> person, scatter by hash(person)
-    let ue_parts = transpose(ue_bufs);
-    let uc_parts = transpose(cl_bufs);
-    let next = AtomicUsize::new(0);
-    let resolved: Vec<(Vec<Vec<PE>>, Vec<Vec<PC>>)> = run_par(nt, |_| {
-        let mut oe: Vec<Vec<PE>> = new_bufs(ev_rows, nt);
-        let mut oc: Vec<Vec<PC>> = new_bufs(cl_rows, nt);
-        loop {
-            let u = next.fetch_add(1, Relaxed);
-            if u >= PB {
-                break;
-            }
-            let lp = &links[u];
-            for piece in std::mem::take(&mut *ue_parts[u].lock().unwrap()) {
-                for e in piece {
-                    if e.price == DEAD {
-                        continue;
-                    }
-                    let (nh, name) = lp.resolve(e.h, e.key);
-                    oe[part(nh)].push(PE { h: nh, key: name, ..e });
-                }
-            }
-            for piece in std::mem::take(&mut *uc_parts[u].lock().unwrap()) {
-                for c in piece {
-                    let (nh, name) = lp.resolve(c.h, c.key);
-                    oc[part(nh)].push(PC { h: nh, key: name, ..c });
-                }
-            }
-        }
-        (oe, oc)
-    });
-    drop(ue_parts);
-    drop(uc_parts);
-    let (pe_bufs, pc_bufs): (Vec<_>, Vec<_>) = resolved.into_iter().unzip();
-    stage("resolve");
-
-    // ---- persons
-    let pev_parts = transpose(pe_bufs);
-    let cl_parts = transpose(pc_bufs);
-    let mut order: Vec<(usize, usize)> = pev_parts
-        .iter()
-        .enumerate()
-        .map(|(q, m)| (q, m.lock().unwrap().iter().map(|v| v.len()).sum()))
-        .collect();
-    order.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
     let user_dir = output.join("user_daily");
     let camp_dir = output.join("campaign_daily");
-    std::fs::create_dir_all(&user_dir).expect("create user_daily");
     std::fs::create_dir_all(&camp_dir).expect("create campaign_daily");
-    let next = AtomicUsize::new(0);
-    let accs: Vec<Acc> = run_par(nt, |tid| {
-        let mut w = Worker::new(&ctx);
-        loop {
-            let k = next.fetch_add(1, Relaxed);
-            if k >= PB {
-                break;
-            }
-            let q = order[k].0;
-            let evs = std::mem::take(&mut *pev_parts[q].lock().unwrap());
-            let cls = std::mem::take(&mut *cl_parts[q].lock().unwrap());
-            w.partition(evs, cls);
-        }
-        if !w.u_name.is_empty() || tid == 0 {
-            w.write_users(&user_dir.join(format!("part-{tid:03}.parquet"))).expect("write user_daily");
-        }
-        w.acc
-    });
-    stage("persons");
+    // Clicks have the wider window. Only store offsets when every accepted
+    // timestamp can fit, including the earliest qualifying click.
+    let accs = if ctx.we.saturating_sub(ctx.cws) <= i64::from(u32::MAX) + 1 {
+        aggregate::<u32>(&files[0], &files[1], target, nt, &ctx, &links, &user_dir, &mut stage)
+    } else {
+        aggregate::<i64>(&files[0], &files[1], target, nt, &ctx, &links, &user_dir, &mut stage)
+    };
 
     // ---- campaign_daily
     let mut accs = accs.into_iter();
