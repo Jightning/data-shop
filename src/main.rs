@@ -42,19 +42,19 @@ fn part(h: u64) -> usize {
 
 // ------------------------------------------------------------------ records
 
-/// One parsed event copy (valid or not), scattered by hash(event_id) for dedup. 64 bytes.
+/// One event copy, for dedup only: its event_id, ingest_ts, and where its record lives in the
+/// user-bucket scatter (thread << 56 | bucket << 48 | index), or NONE if the copy is invalid.
+/// 40 bytes.
 #[derive(Clone, Copy)]
-struct Ev {
+struct D {
     idh: u64,
-    ingest: i64,
-    ts: i64,
     id: Key,
-    user: Key,
-    price: u32,
-    cat: u16,
-    kind: u8,
-    valid: bool,
+    ingest: i64,
+    loc: u64,
 }
+const NONE: u64 = u64::MAX;
+/// `PE::kind` of a valid copy that lost dedup to an earlier-ingested copy.
+const DEAD: u8 = 255;
 
 /// A surviving event keyed by user ID (after dedup) or by person (after resolve). 40 bytes.
 #[derive(Clone, Copy)]
@@ -974,11 +974,13 @@ fn main() {
     let links = build_links(&files[2], target, nt);
     stage("links");
 
-    // ---- events: parse + validate each copy, scatter by hash(event_id)
+    // ---- events: parse + validate each copy. Valid copies go straight to their user bucket;
+    // every copy also leaves a small dedup record, scattered by hash(event_id).
     let ev_chunks = make_chunks(&files[0], target);
     let next = AtomicUsize::new(0);
-    let ev_bufs: Vec<Vec<Vec<Ev>>> = run_par(nt, |_| {
-        let mut bufs: Vec<Vec<Ev>> = new_bufs(ev_rows, nt);
+    let ev_out: Vec<(Vec<Vec<D>>, Vec<Vec<PE>>)> = run_par(nt, |tid| {
+        let mut db: Vec<Vec<D>> = new_bufs(ev_rows, nt);
+        let mut ub: Vec<Vec<PE>> = new_bufs(ev_rows, nt);
         let ctx = &ctx;
         loop {
             let i = next.fetch_add(1, Relaxed);
@@ -1025,22 +1027,22 @@ fn main() {
                 if valid && ingest.saturating_sub(t) > DAY {
                     valid = false;
                 }
+                let loc = if valid {
+                    let uh = hash(f[1].get());
+                    let u = part(uh);
+                    let idx = ub[u].len() as u64;
+                    ub[u].push(PE { h: uh, key: Key::from_bs(f[1]), ts: t, price, cat, kind });
+                    ((tid as u64) << 56) | ((u as u64) << 48) | idx
+                } else {
+                    NONE
+                };
                 let idh = hash(f[0].get());
-                bufs[part(idh)].push(Ev {
-                    idh,
-                    ingest,
-                    ts: t,
-                    id: Key::from_bs(f[0]),
-                    user: if valid { Key::from_bs(f[1]) } else { Key::EMPTY },
-                    price,
-                    cat,
-                    kind,
-                    valid,
-                });
+                db[part(idh)].push(D { idh, id: Key::from_bs(f[0]), ingest, loc });
             });
         }
-        bufs
+        (db, ub)
     });
+    let (d_bufs, mut ue_bufs): (Vec<_>, Vec<_>) = ev_out.into_iter().unzip();
     stage("events");
 
     // ---- clicks: parse + validate, scatter by hash(user_id)
@@ -1075,27 +1077,39 @@ fn main() {
     });
     stage("clicks");
 
-    // ---- dedup per event_id partition, scatter survivors by hash(user_id)
-    let ev_parts = transpose(ev_bufs);
+    // ---- dedup per event_id partition: for each event_id keep the copy with the smallest
+    // ingest_ts; every valid copy that loses is marked DEAD in place in its user bucket.
+    let ue_ptr: Vec<Vec<SyncPtr<PE>>> =
+        ue_bufs.iter_mut().map(|bufs| bufs.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect()).collect();
+    let d_parts = transpose(d_bufs);
     let next = AtomicUsize::new(0);
-    let ue_bufs: Vec<Vec<Vec<PE>>> = run_par(nt, |_| {
-        let mut out: Vec<Vec<PE>> = new_bufs(ev_rows, nt);
+    run_par(nt, |_| {
         // Each bucket is split 16 ways by more hash bits into `scratch` so that every
         // sub-bucket's records and its u32 index table stay L2-resident.
         const SB: usize = 16;
-        let mut scratch: Vec<Ev> = Vec::new();
+        let mut scratch: Vec<D> = Vec::new();
         let mut table: Vec<u32> = Vec::new();
+        let ue_ptr = &ue_ptr;
+        let kill = |d: &D| {
+            if d.loc != NONE {
+                let t = (d.loc >> 56) as usize;
+                let u = ((d.loc >> 48) & 0xff) as usize;
+                let i = (d.loc & ((1 << 48) - 1)) as usize;
+                // Disjoint: each record belongs to one event_id, handled by one thread.
+                unsafe { (*ue_ptr[t][u].at(i)).kind = DEAD };
+            }
+        };
         loop {
             let b = next.fetch_add(1, Relaxed);
             if b >= PB {
                 break;
             }
-            let pieces = std::mem::take(&mut *ev_parts[b].lock().unwrap());
+            let pieces = std::mem::take(&mut *d_parts[b].lock().unwrap());
             let n: usize = pieces.iter().map(|v| v.len()).sum();
             if n == 0 {
                 continue;
             }
-            let sub = |e: &Ev| ((e.idh >> 52) & (SB as u64 - 1)) as usize;
+            let sub = |e: &D| ((e.idh >> 52) & (SB as u64 - 1)) as usize;
             let mut start = [0usize; SB + 1];
             for piece in &pieces {
                 for e in piece.iter() {
@@ -1137,41 +1151,23 @@ fn main() {
                         }
                         let o = &sl[c as usize];
                         if o.idh == e.idh && o.id.same(&e.id) {
+                            // A copy that loses never wins later (the kept ingest_ts only falls), so
+                            // it is marked now. Equal ingest_ts: copies are identical; keep the first.
                             if e.ingest < o.ingest {
+                                kill(o);
                                 table[s] = i as u32;
+                            } else {
+                                kill(e);
                             }
                             break;
                         }
                         s = (s + 1) & mask;
                     }
                 }
-                // Emit in order: a valid copy survives iff it is its event_id's kept copy.
-                for (i, e) in sl.iter().enumerate() {
-                    if !e.valid {
-                        continue;
-                    }
-                    let mut s = (e.idh as usize) & mask;
-                    let winner = loop {
-                        let c = table[s];
-                        if c == i as u32 {
-                            break true;
-                        }
-                        let o = &sl[c as usize];
-                        if o.idh == e.idh && o.id.same(&e.id) {
-                            break false;
-                        }
-                        s = (s + 1) & mask;
-                    };
-                    if winner {
-                        let uh = hash(e.user.get());
-                        out[part(uh)].push(PE { h: uh, key: e.user, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
-                    }
-                }
             }
         }
-        out
     });
-    drop(ev_parts);
+    drop(d_parts);
     stage("dedup");
 
     // ---- resolve: user ID -> person, scatter by hash(person)
@@ -1189,6 +1185,9 @@ fn main() {
             let lp = &links[u];
             for piece in std::mem::take(&mut *ue_parts[u].lock().unwrap()) {
                 for e in piece {
+                    if e.kind == DEAD {
+                        continue;
+                    }
                     let (nh, name) = lp.resolve(e.h, e.key);
                     oe[part(nh)].push(PE { h: nh, key: name, ..e });
                 }
