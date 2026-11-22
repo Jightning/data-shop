@@ -7,3 +7,5 @@ a14b08d	KEEP	1774	10738	events	E3 dedup buckets split 16 ways (L2-resident u32 t
 8d4bc32	KEEP	1592	10735	events	E5 memory-aware malloc reuse (32MB mmap threshold, no trim when input*3 <= 75% of min(MEM_GB,phys)); A/B x7 1638->1462ms, faults 1.24M->0.79M; forced reuse at 60M = 14.4GB so 60M falls back locally
 c848498	KEEP	1738	11628	events	E6 valid events scattered straight to user buckets + 40B dedup records marking losers DEAD in place; A/B x7 dedup 221->65ms, wall 1537->1408ms; faults 0.79M->0.71M (3-run bench20 noisy: 1738)
 e871e41	KEEP	1742	-	events	E7 SSE2 64-byte structural CSV scanner (newline/comma/quote masks) + memcpy-free hash tail; A/B events 696->595ms (-15%, 3 rounds), wall 1810->1742ms; fuzz-tested vs split
+7b6c36f	KEEP	1540	-	events	E7 pinned baseline verified 36 fixtures and 1M reference; runs 2450/1426/1540 ms; perf unavailable; next=benchmark runtime AVX2 delimiter masks and fixed-width timestamp parsing
+6a61d80	KEEP	1364	11633	events	E8 AVX2 delimiter masks and fixed-width timestamps; paired A/B 1582->1291 ms (7/7 wins); stress60 9352 ms; next=measure pinned container scan floor and test cached canonical scatter
