@@ -46,9 +46,7 @@ pub fn hash(b: &[u8]) -> u64 {
     }
     let r = chunks.remainder();
     if !r.is_empty() {
-        let mut buf = [0u8; 8];
-        buf[..r.len()].copy_from_slice(r);
-        h = mix(h, u64::from_le_bytes(buf));
+        h = mix(h, read_partial(r)); // overlapping loads, no memcpy call
     }
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);

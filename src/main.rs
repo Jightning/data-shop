@@ -286,9 +286,8 @@ fn build_links(files: &[&'static [u8]], target: usize, nt: usize) -> Vec<LinkPar
             if i >= chunks.len() {
                 break;
             }
-            csvp::for_lines(chunks[i], |line| {
-                let mut f = [Bs::EMPTY; 2];
-                if csvp::split(line, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
+            csvp::for_records::<2>(chunks[i], |f| {
+                if !f[0].is_empty() && !f[1].is_empty() {
                     for side in 0..2 {
                         let h = hash(f[side].get());
                         bufs[part(h)].push(Occ { h, key: Key::from_bs(f[side]), pair: npairs, side: side as u32 });
@@ -987,9 +986,8 @@ fn main() {
             if i >= ev_chunks.len() {
                 break;
             }
-            csvp::for_lines(ev_chunks[i], |line| {
-                let mut f = [Bs::EMPTY; 7];
-                if !csvp::split(line, &mut f) || f[0].is_empty() {
+            csvp::for_records::<7>(ev_chunks[i], |f| {
+                if f[0].is_empty() {
                     return;
                 }
                 let ingest = ts::parse_ts(f[3].get()).unwrap_or(i64::MAX);
@@ -1056,9 +1054,8 @@ fn main() {
             if i >= cl_chunks.len() {
                 break;
             }
-            csvp::for_lines(cl_chunks[i], |line| {
-                let mut f = [Bs::EMPTY; 4];
-                if !csvp::split(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
+            csvp::for_records::<4>(cl_chunks[i], |f| {
+                if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
                 let t = match ts::parse_ts(f[3].get()) {
