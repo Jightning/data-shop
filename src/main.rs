@@ -53,8 +53,8 @@ struct D {
     loc: u64,
 }
 const NONE: u64 = u64::MAX;
-/// `PE::kind` of a valid copy that lost dedup to an earlier-ingested copy.
-const DEAD: u8 = 255;
+/// Reserved price for a valid copy that lost to an earlier ingest.
+const DEAD: u32 = u32::MAX;
 
 /// A surviving event keyed by user ID (after dedup) or by person (after resolve). 40 bytes.
 #[derive(Clone, Copy)]
@@ -63,8 +63,7 @@ struct PE {
     key: Key,
     ts: i64,
     price: u32,
-    cat: u16,
-    kind: u8,
+    cat: u32,
 }
 
 /// A valid click keyed by user ID (after parse) or by person (after resolve). 56 bytes.
@@ -82,8 +81,7 @@ struct PC {
 struct SE {
     ts: i64,
     price: u32,
-    cat: u16,
-    kind: u8,
+    cat: u32,
 }
 
 /// Per-person compact click for sorting.
@@ -100,10 +98,10 @@ struct Ctx {
     ws: i64,
     we: i64,
     cws: i64,
-    products: StrMap<u16>,
+    products: StrMap<u32>,
     cat_names: Vec<&'static [u8]>, // index = cat id; last is "unknown"
     cat_rank: Vec<u32>,            // byte-wise rank of each category name
-    unknown: u16,
+    unknown: u32,
     campaigns: StrMap<u32>,
     camp_ids: Vec<&'static [u8]>, // index = campaign id; last is "organic"
     camp_channels: Vec<&'static [u8]>,
@@ -521,7 +519,7 @@ struct Worker<'a> {
     u_sess: Vec<i64>,
     u_ev: Vec<i64>,
     u_rev: Vec<i64>,
-    u_top: Vec<i32>,
+    u_top: Vec<u32>,
     // scratch
     pid: Vec<u32>,
     names: Vec<Key>,
@@ -532,9 +530,9 @@ struct Worker<'a> {
     cpid: Vec<u32>,
     sc: Vec<SC>,
     sess: Vec<Sess>,
-    purchases: Vec<(u32, u16, u32)>, // (session idx, cat, price)
+    purchases: Vec<(u32, u32, u32)>, // (session idx, cat, price)
     catsum: Vec<i64>,
-    touched: Vec<u16>,
+    touched: Vec<u32>,
     run_of: Vec<u32>,
     run_end: Vec<u32>,
     run_day: Vec<i64>,
@@ -609,7 +607,7 @@ impl<'a> Worker<'a> {
                 k += 1;
                 let at = self.cur[p] as usize;
                 self.cur[p] += 1;
-                self.se[at] = SE { ts: e.ts, price: e.price, cat: e.cat, kind: e.kind };
+                self.se[at] = SE { ts: e.ts, price: e.price, cat: e.cat };
             }
         }
         drop(evs);
@@ -677,7 +675,7 @@ impl<'a> Worker<'a> {
             let si = self.sess.len() - 1;
             let s = &mut self.sess[si];
             s.nev += 1;
-            if e.kind == 2 {
+            if e.price != 0 {
                 s.rev += e.price as i64;
                 s.purch = true;
                 self.purchases.push((si as u32, e.cat, e.price));
@@ -709,7 +707,7 @@ impl<'a> Worker<'a> {
             self.run_end.push(b as u32);
             self.run_day.push(day);
             // top category
-            let mut top = -1i32;
+            let mut top = u32::MAX;
             while pi < self.purchases.len() && (self.purchases[pi].0 as usize) < b {
                 let (_, cat, price) = self.purchases[pi];
                 if self.catsum[cat as usize] == 0 {
@@ -726,7 +724,7 @@ impl<'a> Worker<'a> {
                         best = c;
                     }
                 }
-                top = best as i32;
+                top = best;
                 for &c in &self.touched {
                     self.catsum[c as usize] = 0;
                 }
@@ -813,7 +811,7 @@ impl<'a> Worker<'a> {
             c_ev.push_i64(self.u_ev[i]);
             c_rev.push_i64(self.u_rev[i]);
             let t = self.u_top[i];
-            c_top.push_str(if t < 0 { None } else { Some(ctx.cat_names[t as usize]) });
+            c_top.push_str(if t == u32::MAX { None } else { Some(ctx.cat_names[t as usize]) });
         }
         parquet::write_file(path, n, &[c_user, c_day, c_sess, c_ev, c_rev, c_top])
     }
@@ -847,8 +845,8 @@ fn main() {
 
     // products.csv
     let pbytes = leak_read(&data.join("products.csv"));
-    let mut products: StrMap<u16> = StrMap::with_capacity(1024);
-    let mut cat_ids: HashMap<&'static [u8], u16> = HashMap::new();
+    let mut products: StrMap<u32> = StrMap::with_capacity(1024);
+    let mut cat_ids: HashMap<&'static [u8], u32> = HashMap::new();
     let mut cat_names: Vec<&'static [u8]> = Vec::new();
     if let Some(h) = memchr::memchr(b'\n', pbytes) {
         csvp::for_lines(&pbytes[h + 1..], |line| {
@@ -857,7 +855,7 @@ fn main() {
                 return;
             }
             let cat = f[1].get();
-            let next = cat_names.len() as u16;
+            let next = cat_names.len() as u32;
             let id = *cat_ids.entry(cat).or_insert_with(|| {
                 cat_names.push(cat);
                 next
@@ -865,7 +863,7 @@ fn main() {
             products.get_or_insert(hash(f[0].get()), f[0], id);
         });
     }
-    let unknown = cat_names.len() as u16;
+    let unknown = cat_names.len() as u32;
     cat_names.push(b"unknown");
     let mut order: Vec<usize> = (0..cat_names.len()).collect();
     order.sort_by(|&a, &b| cat_names[a].cmp(cat_names[b]));
@@ -993,9 +991,9 @@ fn main() {
                 let ingest = ts::parse_ingest(f[3].get()).unwrap_or(i64::MAX);
                 let mut valid = !f[1].is_empty() && !f[5].is_empty();
                 let mut t = 0i64;
-                let mut kind = 0u8;
+                let mut purchase = false;
                 let mut price = 0u32;
-                let mut cat = 0u16;
+                let mut cat = 0u32;
                 if valid {
                     match ts::parse_ts(f[2].get()) {
                         Some(x) if x >= ctx.ws && x < ctx.we => t = x,
@@ -1003,17 +1001,13 @@ fn main() {
                     }
                 }
                 if valid {
-                    kind = match f[4].get() {
-                        b"view" => 0,
-                        b"cart" => 1,
-                        b"purchase" => 2,
-                        _ => {
-                            valid = false;
-                            0
-                        }
-                    };
+                    match f[4].get() {
+                        b"view" | b"cart" => {}
+                        b"purchase" => purchase = true,
+                        _ => valid = false,
+                    }
                 }
-                if valid && kind == 2 {
+                if valid && purchase {
                     match ts::parse_price(f[6].get()) {
                         Some(p) => {
                             price = p;
@@ -1029,7 +1023,7 @@ fn main() {
                     let uh = hash(f[1].get());
                     let u = part(uh);
                     let idx = ub[u].len() as u64;
-                    ub[u].push(PE { h: uh, key: Key::from_bs(f[1]), ts: t, price, cat, kind });
+                    ub[u].push(PE { h: uh, key: Key::from_bs(f[1]), ts: t, price, cat });
                     ((tid as u64) << 56) | ((u as u64) << 48) | idx
                 } else {
                     NONE
@@ -1093,7 +1087,7 @@ fn main() {
                 let u = ((d.loc >> 48) & 0xff) as usize;
                 let i = (d.loc & ((1 << 48) - 1)) as usize;
                 // Disjoint: each record belongs to one event_id, handled by one thread.
-                unsafe { (*ue_ptr[t][u].at(i)).kind = DEAD };
+                unsafe { (*ue_ptr[t][u].at(i)).price = DEAD };
             }
         };
         loop {
@@ -1182,7 +1176,7 @@ fn main() {
             let lp = &links[u];
             for piece in std::mem::take(&mut *ue_parts[u].lock().unwrap()) {
                 for e in piece {
-                    if e.kind == DEAD {
+                    if e.price == DEAD {
                         continue;
                     }
                     let (nh, name) = lp.resolve(e.h, e.key);
