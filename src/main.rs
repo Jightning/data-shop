@@ -990,7 +990,7 @@ fn main() {
                 if f[0].is_empty() {
                     return;
                 }
-                let ingest = ts::parse_ts(f[3].get()).unwrap_or(i64::MAX);
+                let ingest = ts::parse_ingest(f[3].get()).unwrap_or(i64::MAX);
                 let mut valid = !f[1].is_empty() && !f[5].is_empty();
                 let mut t = 0i64;
                 let mut kind = 0u8;

@@ -68,42 +68,39 @@ fn parse_datetime(b: &[u8]) -> Option<i64> {
     Some(days * DAY + (h as i64 * 3600 + mi as i64 * 60 + s as i64) * 1000)
 }
 
-/// Parses F1, F2 or F3 to epoch milliseconds (UTC). `None` means a bad timestamp
-/// (including an F3 value too large for i64, which can never be inside a window).
+/// Ingest timestamps are F1.
 #[inline]
-pub fn parse_ts(b: &[u8]) -> Option<i64> {
-    if b.is_empty() {
+pub fn parse_ingest(b: &[u8]) -> Option<i64> {
+    if b.len() == 20 && b[19] == b'Z' {
+        parse_datetime(b)
+    } else {
+        None
+    }
+}
+
+/// Eight ASCII digits, stored in input order from the least significant byte.
+#[inline]
+fn digits8(word: u64) -> Option<u64> {
+    const HIGH_NIBBLES: u64 = 0xf0f0_f0f0_f0f0_f0f0;
+    const ASCII_ZEROS: u64 = 0x3030_3030_3030_3030;
+    if word & HIGH_NIBBLES != ASCII_ZEROS
+        || (word + 0x0606_0606_0606_0606) & HIGH_NIBBLES != ASCII_ZEROS
+    {
         return None;
     }
-    // F3: digits only (checked first: a 20- or 25-digit string is F3, not F1/F2).
-    if b.iter().all(|c| c.is_ascii_digit()) {
-        let mut i = 0;
-        while i < b.len() && b[i] == b'0' {
-            i += 1;
-        }
-        let rest = &b[i..];
-        if rest.len() > 19 {
-            return None;
-        }
-        let mut v: u64 = 0;
-        for &c in rest {
-            v = v * 10 + (c - b'0') as u64;
-        }
-        return if v > i64::MAX as u64 { None } else { Some(v as i64) };
-    }
+    let digits = word ^ ASCII_ZEROS;
+    let pairs = (digits.wrapping_mul(10).wrapping_add(digits >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let groups = (pairs.wrapping_mul(100).wrapping_add(pairs >> 16)) & 0x0000_ffff_0000_ffff;
+    Some((groups.wrapping_mul(10_000).wrapping_add(groups >> 32)) & 0xffff_ffff)
+}
+
+/// Parses F1, F2 or F3 to epoch milliseconds (UTC). An F3 value too large for
+/// i64 can never be inside a window.
+#[inline]
+pub fn parse_ts(b: &[u8]) -> Option<i64> {
     match b.len() {
-        20 => {
-            if b[19] != b'Z' {
-                return None;
-            }
-            parse_datetime(b)
-        }
-        25 => {
-            let sign: i64 = match b[19] {
-                b'+' => 1,
-                b'-' => -1,
-                _ => return None,
-            };
+        20 if b[19] == b'Z' => return parse_datetime(b),
+        25 if b[19] == b'+' || b[19] == b'-' => {
             if b[22] != b':' {
                 return None;
             }
@@ -113,10 +110,27 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
                 return None;
             }
             let local = parse_datetime(b)?;
-            Some(local - sign * (oh as i64 * 3600 + om as i64 * 60) * 1000)
+            let offset = (oh as i64 * 3600 + om as i64 * 60) * 1000;
+            return Some(if b[19] == b'+' { local - offset } else { local + offset });
         }
-        _ => None,
+        13 => {
+            let hi = digits8(u64::from_le_bytes(b[..8].try_into().unwrap()))?;
+            let lo = digits8(u64::from_le_bytes([
+                b'0', b'0', b'0', b[8], b[9], b[10], b[11], b[12],
+            ]))?;
+            return Some((hi * 100_000 + lo) as i64);
+        }
+        _ => {}
     }
+
+    if b.is_empty() {
+        return None;
+    }
+    let mut value = 0i64;
+    for &c in b {
+        value = value.checked_mul(10)?.checked_add(d1(c)? as i64)?;
+    }
+    Some(value)
 }
 
 /// Purchase price: ASCII digits only, value 1..=10,000,000 (leading zeros allowed).

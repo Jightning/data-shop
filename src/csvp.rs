@@ -36,93 +36,137 @@ fn unquote(s: &'static [u8]) -> Option<Bs> {
 /// Calls `f` with the N unquoted fields of every well-formed line of `chunk`; malformed lines
 /// (empty, wrong field count, a quote not wrapping a whole field) are skipped.
 ///
-/// One structural pass finds every `\n`, `,` and `"` 64 bytes at a time with SSE2 (part of the
-/// x86-64 baseline, so no runtime dispatch is needed); lines without quotes are split straight
-/// from the comma positions, lines with a quote go through the strict `unquote` check.
+/// Delimiter and quote masks let the scanner count quotes without revisiting their positions.
 #[inline]
-pub fn for_records<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(&[Bs; N])) {
-    let len = chunk.len();
-    let p = chunk.as_ptr();
-    let mut line_start = 0usize;
-    let mut commas = [0usize; N];
-    let mut nc = 0usize;
-    let mut quoted = false;
+pub fn for_records<const N: usize>(chunk: &'static [u8], f: impl FnMut(&[Bs; N])) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("popcnt") {
+            // Both instruction sets were checked once for the whole chunk.
+            unsafe { return for_records_avx2(chunk, f) };
+        }
+    }
+    for_records_masked::<N, false>(chunk, f);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn for_records_avx2<const N: usize>(chunk: &'static [u8], f: impl FnMut(&[Bs; N])) {
+    for_records_masked::<N, true>(chunk, f);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn masks<const AVX2: bool>(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let mut commas = 0u64;
+    let mut newlines = 0u64;
+    let mut quotes = 0u64;
+    if AVX2 {
+        for i in [0, 32] {
+            let v = _mm256_loadu_si256(p.add(i).cast());
+            let mask = |b| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b))) as u32 as u64;
+            commas |= mask(b',' as i8) << i;
+            newlines |= mask(b'\n' as i8) << i;
+            quotes |= mask(b'"' as i8) << i;
+        }
+    } else {
+        for i in [0, 16, 32, 48] {
+            let v = _mm_loadu_si128(p.add(i).cast());
+            let mask = |b| _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(b))) as u64;
+            commas |= mask(b',' as i8) << i;
+            newlines |= mask(b'\n' as i8) << i;
+            quotes |= mask(b'"' as i8) << i;
+        }
+    }
+    (commas, newlines, quotes)
+}
+
+#[inline(always)]
+fn for_records_masked<const N: usize, const AVX2: bool>(
+    chunk: &'static [u8],
+    mut f: impl FnMut(&[Bs; N]),
+) {
+    let mut line_start = 0;
+    let mut ends = [0; N];
+    let mut nc = 0;
+    let mut quote_count = 0;
     let mut out = [Bs::EMPTY; N];
 
-    let mut emit = |line_start: usize, end: usize, commas: &[usize; N], nc: usize, quoted: bool| {
-        if end == line_start || nc != N - 1 {
+    let mut emit = |start: usize, end, ends: &mut [usize; N], nc, quote_count| {
+        if end == start || nc != N - 1 {
             return;
         }
-        let mut s = line_start;
-        for k in 0..N {
-            let e = if k < N - 1 { commas[k] } else { end };
-            let field = &chunk[s..e];
-            out[k] = if quoted {
-                match unquote(field) {
-                    Some(b) => b,
-                    None => return,
-                }
+        ends[N - 1] = end;
+        let mut pos = start;
+        let mut wrapping_quotes = 0;
+        for (slot, &end) in out.iter_mut().zip(ends.iter()) {
+            let field = &chunk[pos..end];
+            *slot = if field.len() >= 2 && field[0] == b'"' && field[field.len() - 1] == b'"' {
+                wrapping_quotes += 2;
+                Bs::new(&field[1..field.len() - 1])
             } else {
                 Bs::new(field)
             };
-            s = e + 1;
+            pos = end + 1;
         }
-        f(&out);
-    };
-
-    let mut handle = |pos: usize, line_start: &mut usize, nc: &mut usize, quoted: &mut bool, commas: &mut [usize; N]| {
-        match chunk[pos] {
-            b',' => {
-                if *nc < N - 1 {
-                    commas[*nc] = pos;
-                }
-                *nc += 1;
-            }
-            b'"' => *quoted = true,
-            _ => {
-                // '\n'
-                emit(*line_start, pos, commas, *nc, *quoted);
-                *line_start = pos + 1;
-                *nc = 0;
-                *quoted = false;
-            }
+        // Every quote must have been accounted for by a distinct pair of field endpoints.
+        if wrapping_quotes == quote_count {
+            f(&out);
         }
     };
 
-    let mut i = 0usize;
+    let mut base = 0;
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        use std::arch::x86_64::*;
-        let nl = _mm_set1_epi8(b'\n' as i8);
-        let cm = _mm_set1_epi8(b',' as i8);
-        let qt = _mm_set1_epi8(b'"' as i8);
-        let mask16 = |v: __m128i| -> u64 {
-            let m = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, nl), _mm_cmpeq_epi8(v, cm)), _mm_cmpeq_epi8(v, qt));
-            _mm_movemask_epi8(m) as u32 as u64
-        };
-        while i + 64 <= len {
-            let q = p.add(i) as *const __m128i;
-            let mut m = mask16(_mm_loadu_si128(q))
-                | (mask16(_mm_loadu_si128(q.add(1))) << 16)
-                | (mask16(_mm_loadu_si128(q.add(2))) << 32)
-                | (mask16(_mm_loadu_si128(q.add(3))) << 48);
-            while m != 0 {
-                let pos = i + m.trailing_zeros() as usize;
-                handle(pos, &mut line_start, &mut nc, &mut quoted, &mut commas);
-                m &= m - 1;
+    while base + 64 <= chunk.len() {
+        // The loop bounds give both SIMD implementations 64 readable bytes.
+        let (commas, newlines, mut quotes) = unsafe { masks::<AVX2>(chunk.as_ptr().add(base)) };
+        let mut delimiters = commas | newlines;
+        while delimiters != 0 {
+            let bit = delimiters.trailing_zeros();
+            let pos = base + bit as usize;
+            let remaining = delimiters & (delimiters - 1);
+            let delimiter = delimiters ^ remaining;
+            let lower = delimiter - 1;
+            if newlines & delimiter != 0 {
+                quote_count += (quotes & lower).count_ones() as usize;
+                quotes &= !lower;
+                emit(line_start, pos, &mut ends, nc, quote_count);
+                line_start = pos + 1;
+                nc = 0;
+                quote_count = 0;
+            } else {
+                if nc < N - 1 {
+                    ends[nc] = pos;
+                }
+                nc += 1;
             }
-            i += 64;
+            delimiters = remaining;
+        }
+        quote_count += quotes.count_ones() as usize;
+        base += 64;
+    }
+    for (i, &byte) in chunk[base..].iter().enumerate() {
+        let pos = base + i;
+        match byte {
+            b',' => {
+                if nc < N - 1 {
+                    ends[nc] = pos;
+                }
+                nc += 1;
+            }
+            b'"' => quote_count += 1,
+            b'\n' => {
+                emit(line_start, pos, &mut ends, nc, quote_count);
+                line_start = pos + 1;
+                nc = 0;
+                quote_count = 0;
+            }
+            _ => {}
         }
     }
-    while i < len {
-        let c = chunk[i];
-        if c == b'\n' || c == b',' || c == b'"' {
-            handle(i, &mut line_start, &mut nc, &mut quoted, &mut commas);
-        }
-        i += 1;
-    }
-    if line_start < len {
-        emit(line_start, len, &commas, nc, quoted);
+    if line_start < chunk.len() {
+        emit(line_start, chunk.len(), &mut ends, nc, quote_count);
     }
 }
 
@@ -200,6 +244,9 @@ mod tests {
                 let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
                 for_records::<N>(chunk, |f| got.push(f.iter().map(|b| b.get().to_vec()).collect()));
                 assert_eq!(got, want, "chunk {:?}", String::from_utf8_lossy(chunk));
+                got.clear();
+                for_records_masked::<N, false>(chunk, |f| got.push(f.iter().map(|b| b.get().to_vec()).collect()));
+                assert_eq!(got, want, "fallback on chunk {:?}", String::from_utf8_lossy(chunk));
             }
             check::<2>(chunk);
             check::<4>(chunk);
